@@ -91,7 +91,7 @@ WHERE p.depth < 4
   AND NOT ARRAY_CONTAINS(p.visited, e.dst)
   AND (relationship_type = 'TRANSACTION')
   )
-SELECT 
+SELECT
    _gsql2rsql_dest_id AS id
   ,_gsql2rsql_dest_name AS name
   ,_gsql2rsql_dest_risk_score AS risk_score
@@ -256,7 +256,7 @@ This separation ensures each phase has clear responsibilities and can be tested 
 | Section | Description |
 |---------|-------------|
 | [**User Guide**](user-guide.md) | Getting started, GraphContext, schema setup |
-| [**Examples**](examples/index.md) | 69 complete queries with generated SQL |
+| [**Examples**](examples/index.md) | queries with generated SQL |
 
 ---
 

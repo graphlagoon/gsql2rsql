@@ -190,7 +190,7 @@ This separation ensures each phase has clear responsibilities and can be tested 
 | Section | Description |
 |---------|-------------|
 | [**User Guide**](user-guide.md) | Getting started, GraphContext, schema setup |
-| [**Examples**](examples/index.md) | 69 complete queries with generated SQL |
+| [**Examples**](examples/index.md) | queries with generated SQL |
 
 
 ---

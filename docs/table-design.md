@@ -79,18 +79,6 @@ See [Low-Level API](user-guide.md#low-level-api-without-graphcontext) for how to
 !!! warning "Under Construction"
     This section covers Databricks-specific optimizations. The best approach depends on many factors: data size, query patterns, cluster configuration, and whether you're using Photon.
 
-### Photon for Graph Queries
-
-!!! warning "Cost Consideration"
-    **IN MY EXPERIENCE**, enabling Photon can **almost double your compute costs**. Evaluate whether the performance gains justify the expense for your workload.
-
-**Photon** is Databricks' vectorized query engine. It can significantly accelerate graph queries, especially:
-
-- Large joins (node-edge-node patterns)
-- Recursive CTEs (`WITH RECURSIVE`)
-- Aggregations over paths
-
----
 
 ## Liquid Clustering vs Partitioning with Z-ORDER
 
