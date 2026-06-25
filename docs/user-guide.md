@@ -521,4 +521,4 @@ sql = graph.transpile("""
 
 ## Next Steps
 
-- [**Examples Gallery**](examples/index.md) - 69 complete query examples
+- [**Examples Gallery**](examples/index.md) - query examples

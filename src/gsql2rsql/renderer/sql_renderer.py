@@ -448,11 +448,31 @@ class SQLRenderer:
         # Collect from resolved expressions for this operator
         if op_id in self._resolution_result.resolved_expressions:
             for resolved_expr in self._resolution_result.resolved_expressions[op_id]:
+                # Detect path variables consumed by relationships():
+                # relationships(p) only needs _edges, not the path
+                # nodes array (_id). Collect which bare path vars
+                # are superseded by a relationships() ref.
+                relationships_vars: set[str] = set()
+                for key in resolved_expr.column_refs:
+                    if key.startswith("relationships("):
+                        # Extract var name from "relationships(p)"
+                        var = key[len("relationships("):-1]
+                        relationships_vars.add(var)
+
                 for ref in resolved_expr.all_refs():
+                    # Skip the bare path ref when relationships()
+                    # supersedes it — only _edges is needed
+                    if (
+                        ref.original_property is None
+                        and ref.original_variable in relationships_vars
+                    ):
+                        continue
                     self._required_columns.add(ref.sql_column_name)
                     # Track bare variable references
                     if ref.original_property is None:
-                        self._required_value_fields.add(ref.original_variable)
+                        self._required_value_fields.add(
+                            ref.original_variable
+                        )
 
         # Collect from resolved projections for ProjectionOperators
         if op_id in self._resolution_result.resolved_projections:
@@ -492,7 +512,38 @@ class SQLRenderer:
         """Collect join key columns from JoinOperator (used by both resolution and legacy paths).
 
         Join keys come from schema, not from expressions, so this is shared logic.
+
+        For VLP recursive JoinOperators (identified by recursive_source_alias),
+        node ID join keys are NOT added as required columns because:
+        1. The CTE already provides start_node/end_node — the renderer uses those
+           directly instead of fetching node_id from the nodes table.
+        2. Adding them creates a circular dependency: the node JOIN is "needed"
+           because its join key is required, but the key is only required because
+           we assumed the JOIN exists.
+        The renderer's _is_node_join_needed() separately decides whether the
+        actual source/sink node JOINs are needed based on downstream column usage.
         """
+        # A JoinOperator is "recursive-related" if it IS the recursive
+        # join (recursive_source_alias set) OR if it's the parent join
+        # that connects a root DataSource to a recursive sub-tree
+        # (e.g., NODE_ID pair where one child is DataSource and the
+        # other is a recursive join). We must NOT skip join keys when
+        # joining two recursive sub-trees (double VLP pattern).
+        is_recursive_join = op.recursive_source_alias is not None
+        if not is_recursive_join:
+            has_datasource_child = any(
+                isinstance(child, DataSourceOperator)
+                for child in op.in_operators
+            )
+            has_recursive_child = any(
+                isinstance(child, JoinOperator)
+                and child.recursive_source_alias is not None
+                for child in op.in_operators
+            )
+            is_recursive_join = (
+                has_datasource_child and has_recursive_child
+            )
+
         for pair in op.join_pairs:
             node_alias = pair.node_alias
             rel_alias = pair.relationship_or_node_alias
@@ -507,8 +558,16 @@ class SQLRenderer:
                 None,
             )
 
-            # Add node's join key column
-            if node_field and isinstance(node_field, EntityField):
+            # Add node's join key column.
+            # For VLP recursive JoinOperators, skip: the CTE provides
+            # start_node/end_node directly, so the node ID from a node
+            # table JOIN is not inherently required. The renderer decides
+            # separately whether the node JOIN is needed.
+            if (
+                node_field
+                and isinstance(node_field, EntityField)
+                and not is_recursive_join
+            ):
                 if node_field.node_join_field:
                     # Use pre-rendered field name if available (varlen paths)
                     if node_field.node_join_field.field_name and node_field.node_join_field.field_name.startswith(self.COLUMN_PREFIX):
@@ -519,8 +578,13 @@ class SQLRenderer:
                         )
                     self._required_columns.add(node_key)
 
-            # Add relationship/node's join key column based on pair type
-            if rel_field and isinstance(rel_field, EntityField):
+            # Add relationship/node's join key column based on pair type.
+            # Same recursive-join guard applies to the rel side.
+            if (
+                rel_field
+                and isinstance(rel_field, EntityField)
+                and not is_recursive_join
+            ):
                 if pair.pair_type == JoinKeyPairType.SOURCE:
                     if rel_field.rel_source_join_field:
                         # Use pre-rendered field name if available (varlen paths)

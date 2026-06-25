@@ -8,6 +8,8 @@ Two test classes:
 - TestTempTablesRendering: CREATE TEMPORARY TABLE + INSERT INTO (Databricks)
 """
 
+import re
+
 import pytest
 
 from gsql2rsql.common.exceptions import TranspilerNotSupportedException
@@ -17,6 +19,9 @@ from gsql2rsql.common.schema import (
     NodeSchema,
 )
 from gsql2rsql.parser.opencypher_parser import OpenCypherParser
+from gsql2rsql.planner.bidirectional_optimizer import (
+    apply_bidirectional_optimization,
+)
 from gsql2rsql.planner.logical_plan import LogicalPlan
 from gsql2rsql.planner.pass_manager import optimize_plan
 from gsql2rsql.renderer.schema_provider import (
@@ -75,14 +80,58 @@ def _make_schema() -> SimpleSQLSchemaProvider:
     return schema
 
 
+def _make_multi_edge_schema() -> SimpleSQLSchemaProvider:
+    """Schema with two physical edge tables (forces multi-table UNION ALL)."""
+    schema = SimpleSQLSchemaProvider()
+    schema.add_node(
+        NodeSchema(
+            name="Person",
+            properties=[EntityProperty("node_id", str)],
+            node_id_property=EntityProperty("node_id", str),
+        ),
+        SQLTableDescriptor(
+            table_name="nodes",
+            node_id_columns=["node_id"],
+            filter="node_type = 'Person'",
+        ),
+    )
+    for etype, table in (("KNOWS", "knows_edges"), ("OWNS", "owns_edges")):
+        schema.add_edge(
+            EdgeSchema(
+                name=etype,
+                source_node_id="Person",
+                sink_node_id="Person",
+                source_id_property=EntityProperty("src", str),
+                sink_id_property=EntityProperty("dst", str),
+                properties=[
+                    EntityProperty("src", str),
+                    EntityProperty("dst", str),
+                ],
+            ),
+            SQLTableDescriptor(
+                entity_id=f"Person@{etype}@Person",
+                table_name=table,
+                node_id_columns=["src", "dst"],
+                filter=f"relationship_type = '{etype}'",
+            ),
+        )
+    return schema
+
+
 def _transpile(
     query: str,
     schema: SimpleSQLSchemaProvider,
     *,
     materialization: str = "temp_tables",
     vlp_mode: str = "procedural",
+    bidirectional_mode: str = "off",
 ) -> str:
-    """Transpile a Cypher query with the given strategy."""
+    """Transpile a Cypher query with the given strategy.
+
+    ``bidirectional_mode`` (other than ``"off"``) applies the bidirectional BFS
+    optimization, mirroring ``GraphContext.transpile``; required to reach the
+    bidirectional procedural renderer paths.
+    """
     parser = OpenCypherParser()
     renderer = SQLRenderer(
         db_schema_provider=schema,
@@ -92,6 +141,10 @@ def _transpile(
     ast = parser.parse(query)
     plan = LogicalPlan.process_query_tree(ast, schema)
     optimize_plan(plan)
+    if bidirectional_mode != "off":
+        apply_bidirectional_optimization(
+            plan, graph_schema=schema, mode=bidirectional_mode,
+        )
     plan.resolve(original_query=query)
     return renderer.render_plan(plan)
 
@@ -101,6 +154,51 @@ MATCH (a:Person)-[:KNOWS*1..3]->(b:Person)
 WHERE a.node_id = 'Alice'
 RETURN b.node_id
 """
+
+MIN_HOPS_QUERY = """
+MATCH (a:Person)-[:KNOWS*2..4]->(b:Person)
+WHERE a.node_id = 'Alice'
+RETURN b.node_id
+"""
+
+# Undirected + untyped over multiple physical edge tables → multi-table UNION ALL.
+MULTI_TABLE_QUERY = """
+MATCH (a:Person)-[*1..2]-(b:Person)
+WHERE a.node_id = 'Alice'
+RETURN b.node_id
+"""
+
+# Both endpoints filtered by id → eligible for bidirectional BFS.
+BIDIR_QUERY = """
+MATCH (a:Person)-[:KNOWS*1..4]->(b:Person)
+WHERE a.node_id = 'Alice' AND b.node_id = 'Carol'
+RETURN b.node_id
+"""
+
+
+# A local variable referenced inside a ``CREATE TEMPORARY TABLE/VIEW ... AS``
+# *definition* is rejected by Databricks with
+# ``LOCAL_VARIABLE_IN_TEMP_OBJECT_DEFINITION`` (SQLSTATE 42K0M). Local variables
+# are only legal in DML (INSERT ... SELECT). This helper extracts every
+# temp-object definition body and reports any declared local variable found in
+# one, so tests can assert the transpiler never emits the illegal construct.
+_TEMP_DEF_RE = re.compile(
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?TEMPORARY\s+(?:TABLE|VIEW)\s+(\S+)\s+AS\b(.*?);",
+    re.IGNORECASE | re.DOTALL,
+)
+_DECLARE_RE = re.compile(r"\bDECLARE\s+(\w+)", re.IGNORECASE)
+
+
+def _local_vars_in_temp_definitions(sql: str) -> list[tuple[str, str]]:
+    """Return (object_name, local_var) pairs for each declared local variable
+    referenced inside a CREATE TEMPORARY TABLE/VIEW ... AS definition."""
+    local_vars = set(_DECLARE_RE.findall(sql))
+    hits: list[tuple[str, str]] = []
+    for name, body in _TEMP_DEF_RE.findall(sql):
+        for var in local_vars:
+            if re.search(rf"\b{re.escape(var)}\b", body):
+                hits.append((name, var))
+    return hits
 
 
 # ======================================================================
@@ -385,6 +483,52 @@ class TestTempTablesRendering:
         sql = self._sql(query)
         assert "current_depth_" in sql
         assert ">= 2" in sql
+
+    # 42K0M: no local variable inside a temp-object definition
+    def test_no_local_variable_in_temp_object_definition(self) -> None:
+        """Databricks rejects local vars (e.g. current_depth_N) referenced
+        inside a ``CREATE TEMPORARY TABLE/VIEW ... AS`` definition with
+        LOCAL_VARIABLE_IN_TEMP_OBJECT_DEFINITION (42K0M). The BFS depth must be
+        injected in the result INSERT (DML) instead, never in the bfs_edges
+        definition. Covers single-table, min_hops>1, and multi-table paths."""
+        for query, schema in (
+            (BASIC_QUERY, self.schema),
+            (MIN_HOPS_QUERY, self.schema),
+            (MULTI_TABLE_QUERY, _make_multi_edge_schema()),
+        ):
+            sql = _transpile(query, schema, materialization="temp_tables")
+            hits = _local_vars_in_temp_definitions(sql)
+            assert not hits, (
+                f"local variable(s) leaked into temp-object definition(s): "
+                f"{hits}\n\n{sql}"
+            )
+
+    def test_bidir_no_local_variable_in_temp_object_definition(self) -> None:
+        """Same 42K0M invariant for the bidirectional temp_tables renderer."""
+        sql = _transpile(
+            BIDIR_QUERY, self.schema,
+            materialization="temp_tables", bidirectional_mode="auto",
+        )
+        # Sanity: ensure the bidirectional path was actually exercised.
+        assert "bfs_bwd_visited_" in sql, "bidirectional path not triggered"
+        hits = _local_vars_in_temp_definitions(sql)
+        assert not hits, (
+            f"local variable(s) leaked into temp-object definition(s): "
+            f"{hits}\n\n{sql}"
+        )
+
+    def test_depth_injected_in_result_insert(self) -> None:
+        """_bfs_depth is supplied by current_depth_N in the result INSERT
+        (DML), and the bfs_edges definition no longer carries the column."""
+        sql = self._sql()
+        assert (
+            "SELECT *, current_depth_1 AS _bfs_depth FROM bfs_edges_1" in sql
+        )
+        edge_def = next(
+            body for name, body in _TEMP_DEF_RE.findall(sql)
+            if name.startswith("bfs_edges_")
+        )
+        assert "_bfs_depth" not in edge_def
 
     # Final view
     def test_final_view_cross_join_frontier_init(self) -> None:

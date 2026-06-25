@@ -312,17 +312,28 @@ class PathExpressionAnalyzer:
         # -----------------------------------------------------------------
         # Case 1: Function calls - check for relationships(path) or nodes(path)
         # -----------------------------------------------------------------
+        # -----------------------------------------------------------------
+        # Case 0: Bare path variable reference (e.g., RETURN p, SIZE(p))
+        #
+        # Any direct reference to the path variable (outside nodes()/
+        # relationships()) means the node-ID path array is needed.
+        # -----------------------------------------------------------------
+        if isinstance(expr, QueryExpressionProperty):
+            if expr.variable_name == path_var and not expr.property_name:
+                info.needs_node_collection = True
+
         if isinstance(expr, QueryExpressionFunction):
             if expr.function and expr.function == Function.RELATIONSHIPS:
                 # relationships(path) is called - we need edge collection
                 if self._references_path_variable(expr.parameters, path_var):
                     info.needs_edge_collection = True
+                    return  # Don't recurse into path variable parameter
 
             elif expr.function and expr.function == Function.NODES:
                 # nodes(path) is called - we need node collection
-                # (Currently, nodes are always in the 'path' array anyway)
                 if self._references_path_variable(expr.parameters, path_var):
                     info.needs_node_collection = True
+                    return  # Don't recurse into path variable parameter
 
         # -----------------------------------------------------------------
         # Case 2: List predicates - ALL/ANY/NONE(var IN list WHERE pred)

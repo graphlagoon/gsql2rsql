@@ -97,6 +97,7 @@ class _BFSParams:
     node_type_filter: str | None
     enriched: EnrichedRecursiveOp
     collect_edges: bool = False
+    collect_nodes: bool = False
     # Bidirectional optimization fields
     bidir_mode: str = "off"  # "off", "recursive", "unrolling"
     bidir_depth_forward: int = 0
@@ -178,13 +179,14 @@ class ProceduralBFSRenderer:
 
         lines: list[str] = []
         lines.append(f"{indent}SELECT")
-        lines.append(f"{indent}   start_node,")
-        lines.append(f"{indent}   end_node,")
-        lines.append(f"{indent}   depth,")
+        cols = ["start_node", "end_node", "depth"]
         if op.collect_edges:
-            lines.append(f"{indent}   path_edges,")
-        # path column (NULL placeholder) required by join_renderer's `p.path` ref
-        lines.append(f"{indent}   path")
+            cols.append("path_edges")
+        if op.collect_nodes:
+            cols.append("path")
+        for i, col in enumerate(cols):
+            comma = "," if i < len(cols) - 1 else ""
+            lines.append(f"{indent}   {col}{comma}")
         lines.append(f"{indent}FROM {cte_name}")
 
         # Depth bounds (already enforced by WHILE loop, but kept for safety
@@ -313,6 +315,7 @@ class ProceduralBFSRenderer:
             node_type_filter=node_type_filter,
             enriched=enriched,
             collect_edges=op.collect_edges,
+            collect_nodes=op.collect_nodes,
             bidir_mode=bidir_mode,
             bidir_depth_forward=bidir_depth_forward,
             bidir_depth_backward=bidir_depth_backward,
@@ -542,8 +545,7 @@ class ProceduralBFSRenderer:
         return (
             f"SELECT "
             f"e.{p.src_col}, e.{p.dst_col}{prop_select}, "
-            f"{next_node_expr} AS _next_node, "
-            f"current_depth_{p.n} AS _bfs_depth\n"
+            f"{next_node_expr} AS _next_node\n"
             f"FROM {p.edge_table_sql} e\n"
             f"INNER JOIN bfs_frontier_{p.n} f ON {join_cond}"
             + self._build_where_clause(where_parts)
@@ -574,8 +576,7 @@ class ProceduralBFSRenderer:
             parts.append(
                 f"SELECT "
                 f"e.{p.src_col}, e.{p.dst_col}{prop_select}, "
-                f"{next_node_expr} AS _next_node, "
-                f"current_depth_{p.n} AS _bfs_depth\n"
+                f"{next_node_expr} AS _next_node\n"
                 f"FROM {table_name} e\n"
                 f"INNER JOIN bfs_frontier_{p.n} f ON {join_cond}"
                 + self._build_where_clause(where_parts)
@@ -642,13 +643,15 @@ class ProceduralBFSRenderer:
             )
             lines.append(
                 f"      INSERT INTO bfs_result_{p.n}\n"
-                f"      SELECT * FROM bfs_edges_{p.n};"
+                f"      SELECT *, current_depth_{p.n} AS _bfs_depth "
+                f"FROM bfs_edges_{p.n};"
             )
             lines.append("    END IF;")
         else:
             lines.append(
                 f"    INSERT INTO bfs_result_{p.n}\n"
-                f"    SELECT * FROM bfs_edges_{p.n};"
+                f"    SELECT *, current_depth_{p.n} AS _bfs_depth "
+                f"FROM bfs_edges_{p.n};"
             )
 
         lines.append("  END IF;")
@@ -665,9 +668,12 @@ class ProceduralBFSRenderer:
             path_edges_expr = self._build_path_edges_expr(p, alias="r")
             path_edges_col = f",\n       {path_edges_expr} AS path_edges"
 
-        # Emit a dummy `path` column (NULL) so join_renderer's `p.path` reference resolves.
-        # Procedural BFS doesn't track node-path arrays; use CTE mode for nodes(path).
-        path_col = ",\n       CAST(NULL AS ARRAY<STRING>) AS path"
+        # Only emit path column when collect_nodes is True
+        path_col = ""
+        if p.collect_nodes:
+            path_col = (
+                ",\n       CAST(NULL AS ARRAY<STRING>) AS path"
+            )
 
         return (
             f"CREATE OR REPLACE TEMPORARY VIEW {p.cte_name} AS\n"
@@ -905,13 +911,15 @@ class ProceduralBFSRenderer:
             )
             lines.append(
                 f"      INSERT INTO bfs_result_{p.n}\n"
-                f"      SELECT * FROM bfs_edges_{p.n};"
+                f"      SELECT *, current_depth_{p.n} AS _bfs_depth "
+                f"FROM bfs_edges_{p.n};"
             )
             lines.append("    END IF;")
         else:
             lines.append(
                 f"    INSERT INTO bfs_result_{p.n}\n"
-                f"    SELECT * FROM bfs_edges_{p.n};"
+                f"    SELECT *, current_depth_{p.n} AS _bfs_depth "
+                f"FROM bfs_edges_{p.n};"
             )
 
         lines.append("  END IF;")
@@ -1009,8 +1017,7 @@ class ProceduralBFSRenderer:
                     f"SELECT "
                     f"e.{p.src_col}, e.{p.dst_col}"
                     f"{prop_select}, "
-                    f"{next_node_expr} AS _next_node, "
-                    f"current_depth_{p.n} AS _bfs_depth\n"
+                    f"{next_node_expr} AS _next_node\n"
                     f"FROM {table_name} e\n"
                     f"INNER JOIN bfs_frontier_{p.n} f "
                     f"ON {join_cond}"
@@ -1030,8 +1037,7 @@ class ProceduralBFSRenderer:
         return (
             f"SELECT "
             f"e.{p.src_col}, e.{p.dst_col}{prop_select}, "
-            f"{next_node_expr} AS _next_node, "
-            f"current_depth_{p.n} AS _bfs_depth\n"
+            f"{next_node_expr} AS _next_node\n"
             f"FROM {p.edge_table_sql} e\n"
             f"INNER JOIN bfs_frontier_{p.n} f "
             f"ON {join_cond}"
@@ -1291,10 +1297,17 @@ class ProceduralBFSRenderer:
                 + ">>) AS path_edges"
             )
 
-        # Emit a dummy `path` column (NULL) so join_renderer's `p.path` reference resolves.
-        # Procedural BFS doesn't track node-path arrays; use CTE mode for nodes(path).
-        path_col = ",\n            CAST(NULL AS ARRAY<STRING>) AS path"
-        path_null = ",\n    CAST(NULL AS ARRAY<STRING>) AS path"
+        # Only emit path column when collect_nodes is True
+        path_col = ""
+        path_null = ""
+        if p.collect_nodes:
+            path_col = (
+                ",\n            CAST(NULL AS ARRAY<STRING>)"
+                " AS path"
+            )
+            path_null = (
+                ",\n    CAST(NULL AS ARRAY<STRING>) AS path"
+            )
 
         return (
             f"IF bfs_union_sql_{p.n} != '' THEN\n"

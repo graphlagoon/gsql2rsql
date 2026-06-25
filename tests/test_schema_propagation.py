@@ -676,6 +676,7 @@ class TestRecursiveTraversalScope:
             source_alias="p",
             target_alias="c",
             path_variable="path",
+            collect_nodes=True,
         )
         rec_op.add_in_operator(ds_source)
 

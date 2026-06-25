@@ -155,7 +155,7 @@ class RecursiveTraversalOperator(LogicalOperator):
         # Relationship variable for VLP (e.g., 'r' in [r*1..3])
         # In Cypher, this represents the list of relationships traversed
         self.relationship_variable = relationship_variable
-        self.collect_nodes = collect_nodes or bool(path_variable)
+        self.collect_nodes = collect_nodes
         self.collect_edges = collect_edges or bool(path_variable) or bool(relationship_variable)
         self.edge_properties = edge_properties or []
 
@@ -275,16 +275,18 @@ class RecursiveTraversalOperator(LogicalOperator):
             fields.append(target_field)
 
         # Add path variable if specified (with AUTHORITATIVE structured type)
-        if self.path_variable:
+        # Only add the node-ID path field when collect_nodes is True
+        # (i.e., when nodes(path) or bare path reference is actually used)
+        if self.path_variable and self.collect_nodes:
             path_field = self._create_authoritative_path_field()
             fields.append(path_field)
 
-            # Also add path_edges field when collect_edges is enabled
-            # This is needed for relationships(path) function even without
-            # a named relationship variable (e.g., MATCH p = ()-[*1..3]->())
-            if self.collect_edges:
-                path_edges_field = self._create_path_edges_field()
-                fields.append(path_edges_field)
+        # Add path_edges field when collect_edges is enabled
+        # This is needed for relationships(path) function even without
+        # a named relationship variable (e.g., MATCH p = ()-[*1..3]->())
+        if self.path_variable and self.collect_edges:
+            path_edges_field = self._create_path_edges_field()
+            fields.append(path_edges_field)
 
         # Add relationship variable if specified (e.g., 'e' in [e*1..3])
         # The relationship variable represents the list of edges traversed
