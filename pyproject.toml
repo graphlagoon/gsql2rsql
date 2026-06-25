@@ -1,6 +1,6 @@
 [project]
 name = "gsql2rsql"
-version = "0.10.0"
+version = "0.10.1"
 description = "Transpile Graph Query Language (openCypher) to Recursive SQL (Databricks)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -35,6 +35,7 @@ dev = [
     "ruff>=0.2.0",
     "pyspark>=3.5.0",
 ]
+
 
 [build-system]
 requires = ["hatchling"]
@@ -190,6 +191,7 @@ patch_tags = ["fix", "perf"]
 [tool.semantic_release.remote]
 type = "github"
 ignore_token_for_push = false
+
 
 [dependency-groups]
 dev = [
