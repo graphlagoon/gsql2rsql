@@ -107,6 +107,7 @@ class TestRecursivePathElementStruct:
             source_alias="a",
             target_alias="b",
             path_variable="path",
+            collect_nodes=True,
         )
 
         # Set up input schema (simulating source node)
@@ -141,6 +142,7 @@ class TestRecursivePathElementStruct:
             min_hops=1,
             max_hops=3,
             path_variable="path",
+            collect_nodes=True,
         )
         source_ds = DataSourceOperator(entity=NodeEntity(alias="a", entity_name="Person"))
         source_ds.bind(simple_schema_provider)
@@ -170,6 +172,7 @@ class TestRecursivePathElementStruct:
             min_hops=1,
             max_hops=3,
             path_variable="path",
+            collect_nodes=True,
         )
         source_ds = DataSourceOperator(entity=NodeEntity(alias="a", entity_name="Person"))
         source_ds.bind(simple_schema_provider)
@@ -202,6 +205,7 @@ class TestRecursivePathElementStruct:
             min_hops=1,
             max_hops=3,
             path_variable="path",
+            collect_nodes=True,
         )
         source_ds = DataSourceOperator(entity=NodeEntity(alias="a", entity_name="Person"))
         source_ds.bind(simple_schema_provider)
@@ -234,6 +238,7 @@ class TestRecursivePathElementStruct:
             min_hops=1,
             max_hops=3,
             path_variable="path",
+            collect_nodes=True,
         )
         source_ds = DataSourceOperator(entity=NodeEntity(alias="a", entity_name="Person"))
         source_ds.bind(simple_schema_provider)

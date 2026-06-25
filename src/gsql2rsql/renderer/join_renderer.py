@@ -55,6 +55,39 @@ class JoinRenderer:
             )
         return None
 
+    def _is_node_join_needed(
+        self,
+        node_alias: str,
+        node_info: "EnrichedRecursiveOp | None",
+        table_filter: str | None,
+        has_sink_filter: bool = False,
+    ) -> bool:
+        """Check if a source/sink node JOIN is needed.
+
+        A node JOIN can be skipped when ALL of these are true:
+        1. Column pruning is enabled and required_columns is populated
+        2. No columns with prefix _gsql2rsql_{alias}_ are required
+        3. The node table has no type filter (shared-table discriminator)
+        4. No sink filter is pushed to this join
+        """
+        # Conservative: keep JOIN if pruning not active
+        if (
+            not self._ctx.enable_column_pruning
+            or not self._ctx.required_columns
+        ):
+            return True
+        # Type filter requires the JOIN (e.g., node_type = 'Person')
+        if table_filter:
+            return True
+        # Sink filter pushdown requires the JOIN
+        if has_sink_filter:
+            return True
+        # Check if any required column references this node alias
+        prefix = f"{self._ctx.COLUMN_PREFIX}{node_alias}_"
+        return any(
+            c.startswith(prefix) for c in self._ctx.required_columns
+        )
+
     def _render_recursive_join(
         self,
         join_op: JoinOperator,
@@ -62,37 +95,24 @@ class JoinRenderer:
         target_op: DataSourceOperator,
         depth: int,
     ) -> str:
-        """
-        Render a JOIN between recursive CTE and BOTH source and target node tables.
+        """Render a JOIN between recursive CTE and source/target nodes.
 
-        This method generates a query that:
-        1. JOINs the recursive CTE with the TARGET node (end_node)
-        2. JOINs the recursive CTE with the SOURCE node (start_node)
-
-        Both JOINs are necessary because:
-        - Target node properties are needed for filtering/projection on the end node
-        - Source node properties are needed for filtering/projection on the start node
-
-        Example output:
-            SELECT
-               sink.id AS _gsql2rsql_b_id,
-               sink.name AS _gsql2rsql_b_name,
-               source.id AS _gsql2rsql_a_id,
-               source.name AS _gsql2rsql_a_name,
-               p.path,
-               p.path_edges
-            FROM paths_1 p
-            JOIN Account sink ON sink.id = p.end_node
-            JOIN Account source ON source.id = p.start_node
-            WHERE p.depth >= 2 AND p.depth <= 4
+        Source and sink node JOINs are eliminated when their columns
+        are not referenced downstream and no type/sink filters apply.
         """
         indent = self._ctx.indent(depth)
         cte_name = getattr(recursive_op, "cte_name", "paths")
-        min_depth = recursive_op.min_hops if recursive_op.min_hops is not None else 1
+        min_depth = (
+            recursive_op.min_hops
+            if recursive_op.min_hops is not None
+            else 1
+        )
 
-        # Read enriched recursive op data (pre-resolved by SQLEnrichmentPass)
+        # Read enriched recursive op data
         enriched_rec = (
-            self._ctx.enriched.recursive_ops.get(recursive_op.operator_debug_id)
+            self._ctx.enriched.recursive_ops.get(
+                recursive_op.operator_debug_id
+            )
             if self._ctx.enriched
             else None
         )
@@ -112,17 +132,16 @@ class JoinRenderer:
 
         if not target_node:
             raise TranspilerInternalErrorException(
-                f"No enriched node info for target {target_entity.entity_name}"
+                "No enriched node info for target "
+                f"{target_entity.entity_name}"
             )
 
         target_table = target_node.table_descriptor
         target_id_col = target_node.id_column
 
-        # Get alias for target node (sink) and source node
         target_alias = target_entity.alias or "n"
         source_alias = recursive_op.source_alias or "src"
 
-        # Source node table (fallback to target if not available)
         if source_node:
             source_table = source_node.table_descriptor
             source_id_col = source_node.id_column
@@ -130,100 +149,169 @@ class JoinRenderer:
             source_table = target_table
             source_id_col = target_id_col
 
+        # ---- Determine which JOINs are actually needed ----
+        sink_needed = self._is_node_join_needed(
+            target_alias,
+            enriched_rec,
+            target_node.table_descriptor.filter,
+            has_sink_filter=bool(
+                enriched_rec and enriched_rec.sink_filter_as_sink
+            ),
+        )
+        source_needed = (
+            source_alias != target_alias
+            and self._is_node_join_needed(
+                source_alias,
+                enriched_rec,
+                (
+                    source_node.table_descriptor.filter
+                    if source_node
+                    else None
+                ),
+            )
+        )
+
+        # ---- SELECT columns ----
         lines: list[str] = []
         lines.append(f"{indent}SELECT")
 
-        # Project fields from TARGET node (sink)
         field_lines: list[str] = []
-        if target_node.property_names:
-            field_lines.append(f"sink.{target_id_col} AS {self._ctx.COLUMN_PREFIX}{target_alias}_{target_id_col}")
-            for prop_name in target_node.property_names:
-                if prop_name != target_id_col:
-                    field_lines.append(f"sink.{prop_name} AS {self._ctx.COLUMN_PREFIX}{target_alias}_{prop_name}")
-        else:
-            field_lines.append(f"sink.{target_id_col} AS {self._ctx.COLUMN_PREFIX}{target_alias}_id")
+
+        # Project fields from TARGET node (sink)
+        if sink_needed:
+            if target_node.property_names:
+                field_lines.append(
+                    f"sink.{target_id_col} AS "
+                    f"{self._ctx.COLUMN_PREFIX}"
+                    f"{target_alias}_{target_id_col}"
+                )
+                for prop_name in target_node.property_names:
+                    if prop_name != target_id_col:
+                        field_lines.append(
+                            f"sink.{prop_name} AS "
+                            f"{self._ctx.COLUMN_PREFIX}"
+                            f"{target_alias}_{prop_name}"
+                        )
+            else:
+                field_lines.append(
+                    f"sink.{target_id_col} AS "
+                    f"{self._ctx.COLUMN_PREFIX}{target_alias}_id"
+                )
 
         # Project fields from SOURCE node
-        # Skip if source_alias == target_alias (circular path like (a)-[*]->(a))
-        # In that case, sink and source are the same entity, so we don't want duplicate columns
-        if source_alias != target_alias:
+        if source_needed:
             if source_node and source_node.property_names:
-                field_lines.append(f"source.{source_id_col} AS {self._ctx.COLUMN_PREFIX}{source_alias}_{source_id_col}")
+                field_lines.append(
+                    f"source.{source_id_col} AS "
+                    f"{self._ctx.COLUMN_PREFIX}"
+                    f"{source_alias}_{source_id_col}"
+                )
                 for prop_name in source_node.property_names:
                     if prop_name != source_id_col:
-                        field_lines.append(f"source.{prop_name} AS {self._ctx.COLUMN_PREFIX}{source_alias}_{prop_name}")
+                        field_lines.append(
+                            f"source.{prop_name} AS "
+                            f"{self._ctx.COLUMN_PREFIX}"
+                            f"{source_alias}_{prop_name}"
+                        )
             else:
-                field_lines.append(f"source.{source_id_col} AS {self._ctx.COLUMN_PREFIX}{source_alias}_id")
+                field_lines.append(
+                    f"source.{source_id_col} AS "
+                    f"{self._ctx.COLUMN_PREFIX}{source_alias}_id"
+                )
 
-        # Include path info from CTE
+        # CTE columns
         field_lines.append("p.start_node")
         field_lines.append("p.end_node")
         field_lines.append("p.depth")
 
-        # Include path and path_edges with proper aliases
-        # These need the _gsql2rsql_ prefix to match what column resolver expects
-        # when resolving nodes(path) and relationships(path) function calls
+        # Path and path_edges
         if recursive_op.path_variable:
-            # Alias path array with the standard column naming convention
-            path_alias = f"{self._ctx.COLUMN_PREFIX}{recursive_op.path_variable}_id"
-            field_lines.append(f"p.path AS {path_alias}")
-
-            # Include path_edges if edge collection is enabled (for relationships(path))
+            if recursive_op.collect_nodes:
+                path_alias = (
+                    f"{self._ctx.COLUMN_PREFIX}"
+                    f"{recursive_op.path_variable}_id"
+                )
+                field_lines.append(f"p.path AS {path_alias}")
             if recursive_op.collect_edges:
-                edges_alias = f"{self._ctx.COLUMN_PREFIX}{recursive_op.path_variable}_edges"
-                field_lines.append(f"p.path_edges AS {edges_alias}")
+                edges_alias = (
+                    f"{self._ctx.COLUMN_PREFIX}"
+                    f"{recursive_op.path_variable}_edges"
+                )
+                field_lines.append(
+                    f"p.path_edges AS {edges_alias}"
+                )
         else:
-            # Fallback for queries without explicit path variable
-            field_lines.append("p.path")
+            if recursive_op.collect_nodes:
+                field_lines.append("p.path")
             if recursive_op.collect_edges:
                 field_lines.append("p.path_edges")
 
-        # Handle relationship_variable separately (e.g., 'e' in [e*1..3])
-        # The relationship variable maps to path_edges with a specific alias
         if recursive_op.relationship_variable:
-            edges_alias = f"{self._ctx.COLUMN_PREFIX}{recursive_op.relationship_variable}_edges"
-            field_lines.append(f"p.path_edges AS {edges_alias}")
+            edges_alias = (
+                f"{self._ctx.COLUMN_PREFIX}"
+                f"{recursive_op.relationship_variable}_edges"
+            )
+            field_lines.append(
+                f"p.path_edges AS {edges_alias}"
+            )
 
         for i, field in enumerate(field_lines):
             prefix = " " if i == 0 else ","
             lines.append(f"{indent}  {prefix}{field}")
 
-        # FROM recursive CTE
+        # ---- FROM / JOIN ----
         lines.append(f"{indent}FROM {cte_name} p")
 
-        # JOIN with TARGET node table (end_node = sink)
-        lines.append(f"{indent}JOIN {target_table.full_table_name} sink")
-        lines.append(f"{indent}  ON sink.{target_id_col} = p.end_node")
+        if sink_needed:
+            lines.append(
+                f"{indent}JOIN "
+                f"{target_table.full_table_name} sink"
+            )
+            lines.append(
+                f"{indent}  ON sink.{target_id_col} = p.end_node"
+            )
 
-        # JOIN with SOURCE node table (start_node = source)
-        lines.append(f"{indent}JOIN {source_table.full_table_name} source")
-        lines.append(f"{indent}  ON source.{source_id_col} = p.start_node")
+        if source_needed:
+            lines.append(
+                f"{indent}JOIN "
+                f"{source_table.full_table_name} source"
+            )
+            lines.append(
+                f"{indent}  ON source.{source_id_col} "
+                f"= p.start_node"
+            )
 
-        # WHERE clause for depth bounds
+        # ---- WHERE ----
         where_parts = [f"p.depth >= {min_depth}"]
         if recursive_op.max_hops is not None:
             where_parts.append(f"p.depth <= {recursive_op.max_hops}")
-        # Circular path check: require start_node = end_node for patterns like (a)-[*]->(a)
         if recursive_op.is_circular:
             where_parts.append("p.start_node = p.end_node")
 
-        # Node type filters from labels (e.g., :Person -> node_type = 'Person')
-        # These come from table_descriptor.filter set by enrichment
-        if target_node and target_node.table_descriptor.filter:
-            where_parts.append(f"sink.{target_node.table_descriptor.filter}")
-        if source_node and source_node.table_descriptor.filter:
-            where_parts.append(f"source.{source_node.table_descriptor.filter}")
+        if sink_needed and target_node.table_descriptor.filter:
+            where_parts.append(
+                f"sink.{target_node.table_descriptor.filter}"
+            )
+        if (
+            source_needed
+            and source_node
+            and source_node.table_descriptor.filter
+        ):
+            where_parts.append(
+                f"source.{source_node.table_descriptor.filter}"
+            )
 
-        # SINK NODE FILTER PUSHDOWN: Apply filter on target node here
-        # This filters rows DURING the join rather than AFTER all joins complete
-        enriched_rec = self._get_enriched_recursive(recursive_op)
-        if enriched_rec and enriched_rec.sink_filter_as_sink:
-            sink_filter_sql = self._expr.render_edge_filter_expression(
-                enriched_rec.sink_filter_as_sink
+        if sink_needed and enriched_rec.sink_filter_as_sink:
+            sink_filter_sql = (
+                self._expr.render_edge_filter_expression(
+                    enriched_rec.sink_filter_as_sink
+                )
             )
             where_parts.append(sink_filter_sql)
 
-        lines.append(f"{indent}WHERE {' AND '.join(where_parts)}")
+        lines.append(
+            f"{indent}WHERE {' AND '.join(where_parts)}"
+        )
 
         return "\n".join(lines)
 
@@ -666,7 +754,17 @@ class JoinRenderer:
                     if field.node_join_field:
                         key_name = self._ctx.resolve_field_key(field.node_join_field, field.field_alias)
                         # Skip if already projected
-                        if key_name not in projected_aliases:
+                        if key_name in projected_aliases:
+                            pass  # fall through to encapsulated fields
+                        # Column pruning: skip join key if not required
+                        # (e.g., source node JOIN was eliminated)
+                        elif (
+                            self._ctx.enable_column_pruning
+                            and self._ctx.required_columns
+                            and key_name not in self._ctx.required_columns
+                        ):
+                            pass  # skip this join key
+                        elif key_name not in projected_aliases:
                             # Determine which side of join has this column
                             # Priority: Check actual column presence first (left_columns/right_columns)
                             # then fall back to entity alias membership (defensive)

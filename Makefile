@@ -11,7 +11,7 @@
        docs-serve docs-build docs-deploy docs-clean docs-full generate-readme \
        clean clean-all tree watch-test \
        build check-release version-bump-patch version-bump-minor version-bump-major \
-       changelog release-dry-run release publish-test publish
+       changelog release-dry-run release publish-test publish-dev publish
 
 PYTHON := .venv/bin/python3
 UV := uv
@@ -210,14 +210,12 @@ watch-test:  ## Run tests on file change (requires entr)
 # ─────────────────────────────────────────────────────────────────────────────
 
 build:  ## Build package for distribution
-	$(UV) pip install build
-	python -m build
+	$(UV) build
 
 check-release:  ## Check if package is ready for release
 	@echo "Checking package..."
-	$(UV) pip install twine
-	python -m build
-	twine check dist/*
+	$(UV) build --python $(PYTHON)
+	uvx twine check dist/*
 
 version-bump-patch:  ## Bump patch version (0.1.0 -> 0.1.1)
 	$(UV) pip install python-semantic-release
@@ -251,9 +249,17 @@ release:  ## Create a new release (CI/CD recommended)
 	fi
 
 publish-test:  ## Publish to TestPyPI
-	$(UV) pip install twine
-	python -m build
-	twine upload --repository testpypi dist/*
+	$(UV) build --python $(PYTHON)
+	uvx twine upload --repository testpypi dist/*
+
+publish-dev:  ## Publish dev version to PyPI (e.g., 0.10.0.dev20260320)
+	@BASE_VERSION=$$(grep '^version = ' pyproject.toml | head -1 | sed 's/version = "\(.*\)"/\1/' | sed 's/\.dev.*//') && \
+	DEV_VERSION="$${BASE_VERSION}.dev$$(date +%Y%m%d%H%M)" && \
+	echo "Publishing dev version: $${DEV_VERSION}" && \
+	sed -i "s/^version = \".*\"/version = \"$${DEV_VERSION}\"/" pyproject.toml && \
+	rm -rf dist/ && \
+	($(UV) build --python $(PYTHON) && uvx twine upload dist/*; EXIT=$$?; git checkout pyproject.toml; exit $$EXIT) && \
+	echo "✓ Published $${DEV_VERSION} to PyPI (pyproject.toml restored)"
 
 publish:  ## Publish to PyPI (use GitHub Actions instead)
 	@echo "⚠️  Warning: Use GitHub Actions for releases"
@@ -261,7 +267,6 @@ publish:  ## Publish to PyPI (use GitHub Actions instead)
 	@read -p "Continue anyway? [y/N] " -n 1 -r; \
 	echo; \
 	if [[ $$REPLY =~ ^[Yy]$$ ]]; then \
-		$(UV) pip install twine && \
-		python -m build && \
-		twine upload dist/*; \
+		$(UV) build --python $(PYTHON) && \
+		uvx twine upload dist/*; \
 	fi

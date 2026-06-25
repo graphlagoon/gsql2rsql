@@ -308,7 +308,10 @@ class RecursiveCTERenderer:
         lines.append(f"      n.{op.source_id_column} AS start_node,")
         lines.append(f"      n.{op.source_id_column} AS end_node,")
         lines.append("      0 AS depth,")
-        lines.append(f"      ARRAY(n.{op.source_id_column}) AS path,")
+        if op.collect_nodes:
+            lines.append(
+                f"      ARRAY(n.{op.source_id_column}) AS path,"
+            )
         if op.collect_edges:
             lines.append("      ARRAY() AS path_edges,")
         lines.append("      ARRAY() AS visited")
@@ -343,7 +346,10 @@ class RecursiveCTERenderer:
         base_sql.append(f"      e.{src_col} AS start_node,")
         base_sql.append(f"      e.{dst_col} AS end_node,")
         base_sql.append("      1 AS depth,")
-        base_sql.append(f"      ARRAY(e.{src_col}, e.{dst_col}) AS path,")
+        if op.collect_nodes:
+            base_sql.append(
+                f"      ARRAY(e.{src_col}, e.{dst_col}) AS path,"
+            )
         if op.collect_edges:
             base_sql.append(f"      ARRAY({self._build_edge_struct(ei)}) AS path_edges,")
         base_sql.append(f"      ARRAY(e.{src_col}) AS visited")
@@ -445,7 +451,10 @@ class RecursiveCTERenderer:
         rec.append("      p.start_node,")
         rec.append(f"      e.{end_col} AS end_node,")
         rec.append("      p.depth + 1 AS depth,")
-        rec.append(f"      CONCAT(p.path, ARRAY(e.{end_col})) AS path,")
+        if op.collect_nodes:
+            rec.append(
+                f"      CONCAT(p.path, ARRAY(e.{end_col})) AS path,"
+            )
         if op.collect_edges:
             rec.append(
                 f"      ARRAY_APPEND(p.path_edges, {self._build_edge_struct(ei)}) AS path_edges,"
