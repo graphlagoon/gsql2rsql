@@ -42,7 +42,7 @@ Does NOT: Resolve columns, validate references, make semantic decisions
 
 1. **Clone the repository**
 ```bash
-git clone https://github.com/devmessias/gsql2rsql
+git clone https://github.com/graphlagoon/gsql2rsql
 cd gsql2rsql/python
 ```
 
@@ -292,6 +292,6 @@ make docs-serve     # Serve at http://localhost:8000
 
 ## Getting Help
 
-- **Issues**: [GitHub Issues](https://github.com/devmessias/gsql2rsql/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/devmessias/gsql2rsql/discussions)
-- **Documentation**: [gsql2rsql.dev](https://devmessias.github.io/gsql2rsql)
+- **Issues**: [GitHub Issues](https://github.com/graphlagoon/gsql2rsql/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/graphlagoon/gsql2rsql/discussions)
+- **Documentation**: [gsql2rsql.dev](https://graphlagoon.github.io/gsql2rsql)

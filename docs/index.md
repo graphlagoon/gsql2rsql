@@ -201,15 +201,15 @@ This separation ensures each phase has clear responsibilities and can be tested 
  **Contributions welcome!**
 
 
-- [GitHub Repository](https://github.com/devmessias/gsql2rsql)
-- [Issue Tracker](https://github.com/devmessias/gsql2rsql/issues)
+- [GitHub Repository](https://github.com/graphlagoon/gsql2rsql)
+- [Issue Tracker](https://github.com/graphlagoon/gsql2rsql/issues)
 - [Contributing Guide](contributing.md)
 
 ---
 
 ## License
 
-MIT License - see [LICENSE](https://github.com/devmessias/gsql2rsql/blob/main/LICENSE)
+MIT License - see [LICENSE](https://github.com/graphlagoon/gsql2rsql/blob/main/LICENSE)
 
 ---
 --8<-- "inspiration.md"

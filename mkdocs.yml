@@ -1,10 +1,10 @@
 site_name: gsql2rsql Documentation
 site_description: OpenCypher to Databricks SQL Transpiler - Convert graph queries to SQL
 site_author: gsql2rsql Contributors
-site_url: https://devmessias.github.io/gsql2rsql
+site_url: https://graphlagoon.github.io/gsql2rsql
 
-repo_name: devmessias/gsql2rsql
-repo_url: https://github.com/devmessias/gsql2rsql
+repo_name: graphlagoon/gsql2rsql
+repo_url: https://github.com/graphlagoon/gsql2rsql
 edit_uri: edit/main/docs/
 
 # Copyright
@@ -137,7 +137,7 @@ extra:
     provider: mike
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/devmessias/gsql2rsql
+      link: https://github.com/graphlagoon/gsql2rsql
       name: GitHub Repository
     - icon: fontawesome/brands/python
       link: https://pypi.org/project/gsql2rsql/
@@ -157,7 +157,7 @@ extra:
           data: 0
           note: >-
             Thanks for your feedback! Help us improve by
-            <a href="https://github.com/devmessias/gsql2rsql/issues/new" target="_blank" rel="noopener">filing an issue</a>.
+            <a href="https://github.com/graphlagoon/gsql2rsql/issues/new" target="_blank" rel="noopener">filing an issue</a>.
 
 # Page tree
 nav:
@@ -181,5 +181,4 @@ extra_css:
 
 extra_javascript:
   - javascripts/extra.js
-  - https://polyfill.io/v3/polyfill.min.js?features=es6
   - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
