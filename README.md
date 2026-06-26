@@ -1,8 +1,8 @@
 # gsql2rsql
 
 [![PyPI version](https://badge.fury.io/py/gsql2rsql.svg)](https://badge.fury.io/py/gsql2rsql)
-[![CI](https://github.com/devmessias/gsql2rsql/actions/workflows/ci.yml/badge.svg)](https://github.com/devmessias/gsql2rsql/actions/workflows/ci.yml)
-[![Documentation](https://img.shields.io/badge/docs-mkdocs-blue)](https://devmessias.github.io/gsql2rsql)
+[![CI](https://github.com/graphlagoon/gsql2rsql/actions/workflows/ci.yml/badge.svg)](https://github.com/graphlagoon/gsql2rsql/actions/workflows/ci.yml)
+[![Documentation](https://img.shields.io/badge/docs-mkdocs-blue)](https://graphlagoon.github.io/gsql2rsql)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 
@@ -267,14 +267,14 @@ This separation ensures each phase has clear responsibilities and can be tested 
 
  **Contributions welcome!**
 
-- [GitHub Repository](https://github.com/devmessias/gsql2rsql)
-- [Issue Tracker](https://github.com/devmessias/gsql2rsql/issues)
+- [GitHub Repository](https://github.com/graphlagoon/gsql2rsql)
+- [Issue Tracker](https://github.com/graphlagoon/gsql2rsql/issues)
 - [Contributing Guide](contributing.md)
 
 ---
 
 ## License
 
-MIT License - see [LICENSE](https://github.com/devmessias/gsql2rsql/blob/main/LICENSE)
+MIT License - see [LICENSE](https://github.com/graphlagoon/gsql2rsql/blob/main/LICENSE)
 
 ---

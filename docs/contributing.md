@@ -104,17 +104,17 @@ This prevents:
 
 ### Phase 1: Parser (Lexical/Syntactic Analysis)
 
-**Location**: [src/gsql2rsql/parser/](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/parser/)
+**Location**: [src/gsql2rsql/parser/](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/parser/)
 
 **Responsibility**: Convert OpenCypher query string to Abstract Syntax Tree (AST). Validates **syntax only** — does NOT validate semantics, resolve references, or access schema.
 
 | File | Purpose |
 |------|---------|
-| [`opencypher_parser.py`](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/parser/opencypher_parser.py) | Main entry point, ANTLR runtime invocation |
-| [`ast.py`](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/parser/ast.py) | AST node definitions (50+ node types) |
-| [`visitor.py`](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/parser/visitor.py) | ANTLR visitor pattern implementation |
-| [`operators.py`](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/parser/operators.py) | Operator enums (binary, aggregation, functions) |
-| [`grammar/`](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/parser/grammar/) | ANTLR-generated parser/lexer |
+| [`opencypher_parser.py`](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/parser/opencypher_parser.py) | Main entry point, ANTLR runtime invocation |
+| [`ast.py`](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/parser/ast.py) | AST node definitions (50+ node types) |
+| [`visitor.py`](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/parser/visitor.py) | ANTLR visitor pattern implementation |
+| [`operators.py`](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/parser/operators.py) | Operator enums (binary, aggregation, functions) |
+| [`grammar/`](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/parser/grammar/) | ANTLR-generated parser/lexer |
 
 **Does NOT**:
 
@@ -132,18 +132,18 @@ This prevents:
 
 ### Phase 2: Planner (Logical Operator Construction)
 
-**Location**: [src/gsql2rsql/planner/](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/planner/)
+**Location**: [src/gsql2rsql/planner/](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/planner/)
 
 **Responsibility**: Convert AST to logical relational algebra. Builds symbol table tracking variable definitions and scopes. Does NOT resolve column references or validate property access.
 
 | File | Purpose |
 |------|---------|
-| [`logical_plan.py`](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/planner/logical_plan.py) | Main orchestrator, AST → operator conversion |
-| [`operators.py`](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/planner/operators.py) | Logical operator definitions (11 operator types) |
-| [`symbol_table.py`](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/planner/symbol_table.py) | Variable tracking with nested scopes |
-| [`path_analyzer.py`](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/planner/path_analyzer.py) | Variable-length path optimization |
-| [`schema.py`](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/planner/schema.py) | Internal schema representation |
-| [`subquery_optimizer.py`](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/planner/subquery_optimizer.py) | Conservative subquery flattening |
+| [`logical_plan.py`](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/planner/logical_plan.py) | Main orchestrator, AST → operator conversion |
+| [`operators.py`](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/planner/operators.py) | Logical operator definitions (11 operator types) |
+| [`symbol_table.py`](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/planner/symbol_table.py) | Variable tracking with nested scopes |
+| [`path_analyzer.py`](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/planner/path_analyzer.py) | Variable-length path optimization |
+| [`schema.py`](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/planner/schema.py) | Internal schema representation |
+| [`subquery_optimizer.py`](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/planner/subquery_optimizer.py) | Conservative subquery flattening |
 
 **Does NOT**:
 
@@ -161,7 +161,7 @@ This prevents:
 
 ### Phase 3: Optimizer (Conservative Transformations)
 
-**Location**: [src/gsql2rsql/planner/subquery_optimizer.py](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/planner/subquery_optimizer.py)
+**Location**: [src/gsql2rsql/planner/subquery_optimizer.py](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/planner/subquery_optimizer.py)
 
 **Responsibility**: Apply **conservative** transformations to reduce SQL nesting. Only flattens patterns guaranteed to preserve semantics.
 
@@ -177,14 +177,14 @@ This prevents:
 
 ### Phase 4: Resolver (Column Reference Validation)
 
-**Location**: [src/gsql2rsql/planner/column_resolver.py](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/planner/column_resolver.py)
+**Location**: [src/gsql2rsql/planner/column_resolver.py](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/planner/column_resolver.py)
 
 **Responsibility**: Validate **ALL** column references before rendering. Query schema for entity properties. Build resolution context for SQL generation.
 
 | File | Purpose |
 |------|---------|
-| [`column_resolver.py`](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/planner/column_resolver.py) | Main resolver implementation |
-| [`column_ref.py`](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/planner/column_ref.py) | Resolved reference objects |
+| [`column_resolver.py`](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/planner/column_resolver.py) | Main resolver implementation |
+| [`column_ref.py`](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/planner/column_ref.py) | Resolved reference objects |
 
 **Does NOT**:
 
@@ -201,14 +201,14 @@ This prevents:
 
 ### Phase 5: Renderer (SQL Generation)
 
-**Location**: [src/gsql2rsql/renderer/sql_renderer.py](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/renderer/sql_renderer.py)
+**Location**: [src/gsql2rsql/renderer/sql_renderer.py](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/renderer/sql_renderer.py)
 
 **Responsibility**: Generate Databricks Databricks SQL from logical plan using pre-resolved column references. Handle SQL dialect specifics.
 
 | File | Purpose |
 |------|---------|
-| [`sql_renderer.py`](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/renderer/sql_renderer.py) | Main SQL code generator |
-| [`schema_provider.py`](https://github.com/devmessias/gsql2rsql/tree/main/python/src/gsql2rsql/renderer/schema_provider.py) | Database schema provider interface |
+| [`sql_renderer.py`](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/renderer/sql_renderer.py) | Main SQL code generator |
+| [`schema_provider.py`](https://github.com/graphlagoon/gsql2rsql/tree/main/python/src/gsql2rsql/renderer/schema_provider.py) | Database schema provider interface |
 
 **Does NOT**:
 

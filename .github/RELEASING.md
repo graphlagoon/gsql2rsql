@@ -57,7 +57,7 @@ make publish  # Publishes to PyPI
 
 1. Go to https://pypi.org/manage/account/publishing/
 2. Add trusted publisher:
-   - Repository: `devmessias/gsql2rsql`
+   - Repository: `graphlagoon/gsql2rsql`
    - Workflow: `release.yml`
    - Environment: (empty)
 
