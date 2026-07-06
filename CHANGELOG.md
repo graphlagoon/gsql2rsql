@@ -2,6 +2,17 @@
 
 
 
+## v0.10.2 (2026-07-06)
+
+### Documentation
+
+* docs: update repo path ([`cba8eeb`](https://github.com/graphlagoon/gsql2rsql/commit/cba8eebea7718eb24e93f36e3778be25c5a81181))
+
+### Performance
+
+* perf: optimize BFS SQL transpilation with adjacency materialization and deferred payload ([`d8d6045`](https://github.com/graphlagoon/gsql2rsql/commit/d8d6045b047880d4d8115729a3ff8d2c813b7eea))
+
+
 ## v0.10.1 (2026-06-25)
 
 ### Documentation
