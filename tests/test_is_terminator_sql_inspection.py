@@ -23,6 +23,9 @@ from gsql2rsql.common.schema import (
 from gsql2rsql.parser.opencypher_parser import OpenCypherParser
 from gsql2rsql.planner.logical_plan import LogicalPlan
 from gsql2rsql.planner.pass_manager import optimize_plan
+from gsql2rsql.renderer.procedural_bfs_renderer import (
+    ProceduralBFSOptimizations,
+)
 from gsql2rsql.renderer.schema_provider import (
     SimpleSQLSchemaProvider,
     SQLTableDescriptor,
@@ -85,6 +88,7 @@ def _transpile(
     *,
     materialization: str = "temp_tables",
     vlp_mode: str = "procedural",
+    procedural_optimizations: "ProceduralBFSOptimizations | None" = None,
 ) -> str:
     """Transpile a Cypher query with the given strategy."""
     parser = OpenCypherParser()
@@ -92,6 +96,7 @@ def _transpile(
         db_schema_provider=schema,
         vlp_rendering_mode=vlp_mode,
         materialization_strategy=materialization,
+        procedural_optimizations=procedural_optimizations,
     )
     ast = parser.parse(query)
     plan = LogicalPlan.process_query_tree(ast, schema)
@@ -110,6 +115,20 @@ def _find_lines_containing(sql: str, pattern: str) -> list[str]:
     return [
         line for line in sql.splitlines()
         if pattern.lower() in line.lower()
+    ]
+
+
+def _barrier_not_exists_lines(sql: str) -> list[str]:
+    """Return only the NOT EXISTS lines emitted by is_terminator (barrier).
+
+    Procedural BFS edge expansion now also emits a NOT EXISTS for the
+    visited-set exclusion (alias ``v``, table ``bfs_visited_*``) — see O5 in
+    docs_help_dev/analysis_canonical_query_bfs_memory.md. The barrier NOT
+    EXISTS is distinguished by its ``barrier`` subquery alias.
+    """
+    return [
+        line for line in sql.splitlines()
+        if "not exists" in line.lower() and "barrier" in line.lower()
     ]
 
 
@@ -146,35 +165,76 @@ class TestIsTerminatorTempTablesSQLStructure:
         print(f"\n=== temp_tables barrier SQL ===\n{sql}")
         assert "NOT EXISTS" in sql, "Barrier NOT EXISTS missing from SQL"
 
+    def _legacy_sql(self, query: str = BARRIER_QUERY) -> str:
+        """Legacy (all_off) SQL: per-level barrier NOT EXISTS, alias
+        'barrier', inside the WHILE loop's frontier rebuild."""
+        return _transpile(
+            query, self.schema, materialization="temp_tables",
+            procedural_optimizations=ProceduralBFSOptimizations.all_off(),
+        )
+
     def test_barrier_references_correct_table_and_alias(self) -> None:
-        """NOT EXISTS subquery must reference hub_nodes with 'barrier' alias."""
-        sql = self._sql()
-        not_exists_lines = _find_lines_containing(sql, "NOT EXISTS")
+        """Legacy per-level NOT EXISTS subquery must reference hub_nodes
+        with 'barrier' alias.
+
+        With ``barrier_precompute`` (default ON) the per-level check
+        becomes an anti-join against the precomputed ``bfs_barrier_N``
+        table (alias ``b``, no per-level 'barrier'/'hub_nodes' text) — see
+        ``test_barrier_precompute_table`` for that form's assertions.
+        """
+        sql = self._legacy_sql()
+        not_exists_lines = _barrier_not_exists_lines(sql)
         assert len(not_exists_lines) >= 1
         ne_text = not_exists_lines[0]
         assert "hub_nodes" in ne_text, f"Should query hub_nodes, got: {ne_text}"
         assert "barrier" in ne_text, f"Should use 'barrier' alias, got: {ne_text}"
 
     def test_barrier_checks_node_id_column(self) -> None:
-        """NOT EXISTS should join barrier.node_id = _next_node."""
-        sql = self._sql()
-        not_exists_lines = _find_lines_containing(sql, "NOT EXISTS")
+        """Legacy per-level NOT EXISTS should join barrier.node_id =
+        _next_node."""
+        sql = self._legacy_sql()
+        not_exists_lines = _barrier_not_exists_lines(sql)
         assert len(not_exists_lines) >= 1
         ne_text = not_exists_lines[0]
         assert "barrier.node_id" in ne_text, f"Should check barrier.node_id, got: {ne_text}"
 
     def test_barrier_includes_predicate(self) -> None:
-        """NOT EXISTS should filter on barrier.is_hub."""
-        sql = self._sql()
-        not_exists_lines = _find_lines_containing(sql, "NOT EXISTS")
+        """Legacy per-level NOT EXISTS should filter on barrier.is_hub."""
+        sql = self._legacy_sql()
+        not_exists_lines = _barrier_not_exists_lines(sql)
         assert len(not_exists_lines) >= 1
         ne_text = not_exists_lines[0]
         assert "barrier.is_hub" in ne_text.lower() or "is_hub" in ne_text, (
             f"Should filter on barrier.is_hub, got: {ne_text}"
         )
 
+    def test_barrier_precompute_table(self) -> None:
+        """Default (barrier_precompute=ON): the barrier decision is
+        materialized once, before the loop, as ``SELECT DISTINCT`` over
+        hub_nodes with the 'barrier' alias; the loop then anti-joins this
+        small table (alias ``b``) instead of re-scanning hub_nodes."""
+        sql = self._sql()
+        assert "CREATE TEMPORARY TABLE bfs_barrier_1 AS" in sql
+        assert sql.index("bfs_barrier_1") < sql.index("WHILE")
+        precompute = sql[
+            sql.index("CREATE TEMPORARY TABLE bfs_barrier_1"):
+            sql.index("WHILE")
+        ]
+        assert "SELECT DISTINCT" in precompute
+        assert "hub_nodes" in precompute
+        assert "barrier.node_id" in precompute
+        assert "barrier.is_hub" in precompute.lower() or "is_hub" in precompute
+        loop_body = sql[sql.index("WHILE"):sql.index("END WHILE")]
+        assert "FROM bfs_barrier_1 b" in loop_body
+        assert "hub_nodes" not in loop_body
+
     def test_barrier_not_in_edge_expansion(self) -> None:
-        """NOT EXISTS should NOT appear in edge expansion (bfs_edges)."""
+        """The barrier NOT EXISTS should NOT appear in edge expansion.
+
+        The edge expansion does carry the visited-set exclusion NOT EXISTS
+        (alias ``v``); what must not leak here is the *barrier* NOT EXISTS
+        (alias ``barrier``) — it belongs in the frontier rebuild.
+        """
         sql = self._sql()
         # Find the edge expansion section
         lines = sql.splitlines()
@@ -189,8 +249,8 @@ class TestIsTerminatorTempTablesSQLStructure:
                     in_edge_expansion = False
 
         edge_section = "\n".join(edge_expansion_lines)
-        assert "NOT EXISTS" not in edge_section, (
-            f"NOT EXISTS should NOT be in edge expansion:\n{edge_section}"
+        assert "barrier" not in edge_section.lower(), (
+            f"Barrier should NOT be in edge expansion:\n{edge_section}"
         )
 
     def test_barrier_in_frontier_inside_while(self) -> None:
@@ -214,14 +274,25 @@ class TestIsTerminatorTempTablesSQLStructure:
         )
 
     def test_barrier_node_type_filter_included(self) -> None:
-        """The NOT EXISTS subquery should include the node type filter."""
-        sql = self._sql()
-        not_exists_lines = _find_lines_containing(sql, "NOT EXISTS")
+        """Legacy per-level NOT EXISTS subquery should include the node
+        type filter."""
+        sql = self._legacy_sql()
+        not_exists_lines = _barrier_not_exists_lines(sql)
         assert len(not_exists_lines) >= 1
         ne_text = not_exists_lines[0]
         assert "node_type" in ne_text, (
             f"NOT EXISTS should include node_type filter, got: {ne_text}"
         )
+
+    def test_barrier_precompute_node_type_filter_included(self) -> None:
+        """Default (barrier_precompute=ON): the node type filter is
+        applied once in the precompute WHERE clause."""
+        sql = self._sql()
+        precompute = sql[
+            sql.index("CREATE TEMPORARY TABLE bfs_barrier_1"):
+            sql.index("WHILE")
+        ]
+        assert "node_type" in precompute
 
     def test_barrier_with_sink_filter(self) -> None:
         """When sink filter coexists with barrier, both should be present."""
@@ -251,10 +322,14 @@ class TestIsTerminatorTempTablesSQLStructure:
         assert "src_is_hub" in sql, "Edge predicate missing from SQL"
 
     def test_no_barrier_no_not_exists(self) -> None:
-        """Without is_terminator, no NOT EXISTS should appear."""
+        """Without is_terminator, no *barrier* NOT EXISTS should appear.
+
+        (The visited-set exclusion NOT EXISTS, alias ``v``, is always present
+        in procedural BFS — see O5 — so this asserts only the barrier is gone.)
+        """
         sql = _transpile(NO_BARRIER_QUERY, self.schema, materialization="temp_tables")
-        assert "NOT EXISTS" not in sql, (
-            f"NOT EXISTS should NOT appear without is_terminator:\n{sql}"
+        assert "barrier" not in sql.lower(), (
+            f"Barrier should NOT appear without is_terminator:\n{sql}"
         )
 
 
@@ -288,9 +363,12 @@ class TestIsTerminatorNumberedViewsSQLStructure:
         assert "NOT EXISTS" in sql
 
     def test_no_barrier_no_not_exists(self) -> None:
-        """Without is_terminator, no NOT EXISTS in numbered_views."""
+        """Without is_terminator, no *barrier* NOT EXISTS in numbered_views.
+
+        (Visited-set exclusion NOT EXISTS, alias ``v``, is always present.)
+        """
         sql = _transpile(NO_BARRIER_QUERY, self.schema, materialization="numbered_views")
-        assert "NOT EXISTS" not in sql
+        assert "barrier" not in sql.lower()
 
 
 # ===================================================================
@@ -329,7 +407,7 @@ class TestIsTerminatorCTESQLStructure:
     def test_barrier_references_end_node(self) -> None:
         """NOT EXISTS should reference p.end_node (the node being expanded FROM)."""
         sql = self._sql()
-        not_exists_lines = _find_lines_containing(sql, "NOT EXISTS")
+        not_exists_lines = _barrier_not_exists_lines(sql)
         assert len(not_exists_lines) >= 1
         ne_text = not_exists_lines[0]
         assert "p.end_node" in ne_text, (
@@ -372,7 +450,8 @@ class TestTempTablesDetailedAnalysis:
         self.schema = _make_schema()
 
     def test_full_sql_structure(self) -> None:
-        """Validate the complete SQL structure for temp_tables with barrier."""
+        """Validate the complete SQL structure for temp_tables with barrier
+        (default flags: barrier_precompute=ON)."""
         sql = _transpile(BARRIER_QUERY, self.schema, materialization="temp_tables")
         print(f"\n=== FULL temp_tables SQL ===\n{sql}")
 
@@ -382,20 +461,27 @@ class TestTempTablesDetailedAnalysis:
         # 2. Must have WHILE loop
         assert "WHILE" in sql
 
-        # 3. Edge expansion must NOT have NOT EXISTS
+        # 3. The barrier precompute (hub_nodes scan) happens ONCE, before
+        # the loop — not inside it.
+        assert "CREATE TEMPORARY TABLE bfs_barrier_1 AS" in sql
+        assert sql.index("bfs_barrier_1") < sql.index("WHILE")
+
         in_while = sql.split("WHILE", 1)[1]
-        # Match specifically the CREATE that creates bfs_edges_N
+
+        # 4. Edge expansion must NOT have the *barrier* NOT EXISTS.
+        # (It does carry the visited-set exclusion NOT EXISTS, alias 'v' — O5.)
         edge_matches = re.findall(
             r"CREATE TEMPORARY TABLE bfs_edges_\d+ AS\b.*?;",
             in_while,
             re.DOTALL,
         )
         for edge_sql in edge_matches:
-            assert "NOT EXISTS" not in edge_sql, (
-                f"NOT EXISTS leaked into edge expansion:\n{edge_sql}"
+            assert "barrier" not in edge_sql.lower(), (
+                f"Barrier leaked into edge expansion:\n{edge_sql}"
             )
 
-        # 4. Frontier creation inside WHILE must have NOT EXISTS
+        # 5. Frontier creation inside WHILE must anti-join the precomputed
+        # barrier table (alias 'b'), NOT re-scan hub_nodes.
         frontier_match = re.search(
             r"CREATE TEMPORARY TABLE bfs_frontier_\d+ AS\b.*?;",
             in_while,
@@ -406,12 +492,12 @@ class TestTempTablesDetailedAnalysis:
         assert "NOT EXISTS" in frontier_sql, (
             f"NOT EXISTS missing from frontier inside WHILE:\n{frontier_sql}"
         )
-        # Verify barrier components
-        assert "hub_nodes" in frontier_sql, "Missing hub_nodes table"
-        assert "barrier" in frontier_sql, "Missing barrier alias"
-        assert "is_hub" in frontier_sql, "Missing is_hub predicate"
+        assert "bfs_barrier_1 b" in frontier_sql, "Missing precomputed barrier anti-join"
+        assert "hub_nodes" not in frontier_sql, (
+            "hub_nodes should not be re-scanned inside the loop"
+        )
 
-        # 5. Result accumulation must NOT have NOT EXISTS
+        # 6. Result accumulation must NOT have NOT EXISTS
         result_matches = re.findall(
             r"INSERT INTO bfs_result.*?;",
             in_while,
@@ -421,6 +507,27 @@ class TestTempTablesDetailedAnalysis:
             assert "NOT EXISTS" not in result_sql, (
                 f"NOT EXISTS leaked into result accumulation:\n{result_sql}"
             )
+
+    def test_full_sql_structure_legacy_all_off(self) -> None:
+        """``all_off()`` reproduces the legacy per-level barrier scan
+        (hub_nodes re-scanned inside the WHILE loop, alias 'barrier')."""
+        sql = _transpile(
+            BARRIER_QUERY, self.schema, materialization="temp_tables",
+            procedural_optimizations=ProceduralBFSOptimizations.all_off(),
+        )
+        assert "bfs_barrier_1" not in sql
+        in_while = sql.split("WHILE", 1)[1]
+        frontier_match = re.search(
+            r"CREATE TEMPORARY TABLE bfs_frontier_\d+ AS\b.*?;",
+            in_while,
+            re.DOTALL,
+        )
+        assert frontier_match is not None
+        frontier_sql = frontier_match.group(0)
+        assert "NOT EXISTS" in frontier_sql
+        assert "hub_nodes" in frontier_sql
+        assert "barrier" in frontier_sql
+        assert "is_hub" in frontier_sql
 
     def test_barrier_semantics_correctness(self) -> None:
         """Verify barrier is semantically correct:

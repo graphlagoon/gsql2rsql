@@ -38,7 +38,10 @@ from gsql2rsql.planner.operators import (
 from gsql2rsql.planner.schema import EntityField, EntityType, Schema
 from gsql2rsql.renderer.expression_renderer import ExpressionRenderer
 from gsql2rsql.renderer.join_renderer import JoinRenderer
-from gsql2rsql.renderer.procedural_bfs_renderer import ProceduralBFSRenderer
+from gsql2rsql.renderer.procedural_bfs_renderer import (
+    ProceduralBFSOptimizations,
+    ProceduralBFSRenderer,
+)
 from gsql2rsql.renderer.recursive_cte_renderer import RecursiveCTERenderer
 from gsql2rsql.renderer.render_context import RenderContext
 from gsql2rsql.renderer.schema_provider import ISQLDBSchemaProvider
@@ -67,6 +70,7 @@ class SQLRenderer:
         config: dict[str, Any] | None = None,
         vlp_rendering_mode: str = "cte",
         materialization_strategy: str = "temp_tables",
+        procedural_optimizations: "ProceduralBFSOptimizations | None" = None,
     ) -> None:
         """
         Initialize the SQL renderer.
@@ -103,6 +107,9 @@ class SQLRenderer:
         self._config = config or {}
         self._vlp_rendering_mode = vlp_rendering_mode
         self._materialization_strategy = materialization_strategy
+        self._procedural_optimizations = (
+            procedural_optimizations or ProceduralBFSOptimizations()
+        )
 
     @property
     def _db_schema(self) -> ISQLDBSchemaProvider:
@@ -151,6 +158,7 @@ class SQLRenderer:
             enriched=enriched,
             vlp_rendering_mode=self._vlp_rendering_mode,
             materialization_strategy=self._materialization_strategy,
+            procedural_optimizations=self._procedural_optimizations,
         )
         ctx.cte_counter = self._cte_counter
         ctx.join_alias_counter = self._join_alias_counter

@@ -17,6 +17,9 @@ from gsql2rsql.planner.schema import EntityField, EntityType, Schema, ValueField
 from gsql2rsql.renderer.schema_provider import ISQLDBSchemaProvider
 
 if TYPE_CHECKING:
+    from gsql2rsql.renderer.procedural_bfs_renderer import (
+        ProceduralBFSOptimizations,
+    )
     from gsql2rsql.renderer.sql_enrichment import EnrichedPlanData
 
 
@@ -41,6 +44,7 @@ class RenderContext:
         enriched: EnrichedPlanData | None = None,
         vlp_rendering_mode: str = "cte",
         materialization_strategy: str = "temp_tables",
+        procedural_optimizations: ProceduralBFSOptimizations | None = None,
     ) -> None:
         self.db_schema = db_schema
         self.resolution_result = resolution_result
@@ -51,6 +55,14 @@ class RenderContext:
         self.enriched = enriched
         self.vlp_rendering_mode = vlp_rendering_mode
         self.materialization_strategy = materialization_strategy
+        if procedural_optimizations is None:
+            # Local import to avoid a circular module dependency
+            # (procedural_bfs_renderer imports RenderContext for typing).
+            from gsql2rsql.renderer.procedural_bfs_renderer import (
+                ProceduralBFSOptimizations,
+            )
+            procedural_optimizations = ProceduralBFSOptimizations()
+        self.procedural_optimizations = procedural_optimizations
         self._cte_counter = 0
         self._join_alias_counter = 0
 
