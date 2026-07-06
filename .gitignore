@@ -1,4 +1,5 @@
 spark-warehouse
+metastore_db
 poc_*
 tests/output/
 out/

@@ -37,6 +37,9 @@ from gsql2rsql.renderer.schema_provider import (
     SimpleSQLSchemaProvider,
     SQLTableDescriptor,
 )
+from gsql2rsql.renderer.procedural_bfs_renderer import (
+    ProceduralBFSOptimizations,
+)
 from gsql2rsql.renderer.sql_renderer import SQLRenderer
 
 if TYPE_CHECKING:
@@ -156,6 +159,7 @@ class GraphContext:
         self._renderer: SQLRenderer | None = None  # Lazy init after schemas are ready
         self._vlp_rendering_mode: str = "cte"
         self._materialization_strategy: str = "temp_tables"
+        self._procedural_optimizations = ProceduralBFSOptimizations()
 
     def _discover_types(self) -> None:
         """Auto-discover node and edge types from tables."""
@@ -365,6 +369,7 @@ class GraphContext:
         materialization_strategy: Literal[
             "temp_tables", "numbered_views"
         ] = "temp_tables",
+        procedural_optimizations: "ProceduralBFSOptimizations | None" = None,
     ) -> str:
         """Transpile OpenCypher query to Databricks SQL.
 
@@ -400,18 +405,24 @@ class GraphContext:
                 "Schema not initialized. Call set_types() or provide spark parameter."
             )
 
-        # Lazy initialize renderer (recreate when mode/strategy changes)
+        if procedural_optimizations is None:
+            procedural_optimizations = ProceduralBFSOptimizations()
+
+        # Lazy initialize renderer (recreate when mode/strategy/options change)
         if (
             self._renderer is None
             or self._vlp_rendering_mode != vlp_rendering_mode
             or self._materialization_strategy != materialization_strategy
+            or self._procedural_optimizations != procedural_optimizations
         ):
             self._vlp_rendering_mode = vlp_rendering_mode
             self._materialization_strategy = materialization_strategy
+            self._procedural_optimizations = procedural_optimizations
             self._renderer = SQLRenderer(
                 db_schema_provider=self._schema,
                 vlp_rendering_mode=vlp_rendering_mode,
                 materialization_strategy=materialization_strategy,
+                procedural_optimizations=procedural_optimizations,
             )
 
         # Parse query

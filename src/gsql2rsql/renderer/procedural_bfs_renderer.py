@@ -44,6 +44,185 @@ if TYPE_CHECKING:
     from gsql2rsql.renderer.sql_enrichment import EnrichedRecursiveOp
 
 
+@dataclass(frozen=True)
+class ProceduralBFSOptimizations:
+    """Feature flags for procedural-BFS SQL generation.
+
+    Each flag guards one independently-verified, result-preserving rewrite so
+    a production regression on an untested engine (e.g. Databricks SQL
+    Warehouse, which we cannot exercise locally) can be bisected by toggling a
+    single flag. Defaults follow the measured A/B evidence in
+    docs_help_dev/analysis_canonical_query_bfs_memory.md: the two *safe* flags
+    (asymmetric protection, ~zero cost) default ON; the one that regressed in
+    the numbered_views lazy-lineage regime defaults OFF.
+
+    Attributes:
+        visited_not_exists: (default ON) O5 — emit the visited-set exclusion
+            as ``NOT EXISTS (SELECT 1 FROM bfs_visited... v WHERE v.node =
+            ...)`` instead of ``... NOT IN (SELECT node FROM bfs_visited...)``.
+            NOT IN is a null-aware anti-join that Spark can only execute as an
+            unconditional broadcast of the whole visited set (no shuffle
+            fallback; ignores autoBroadcastJoinThreshold), OOMing the driver
+            once visited grows in deep BFS. Measured: −39% peak execution
+            memory on the real transpiled SQL, time-neutral at small scale.
+            The NOT EXISTS probe carries an ``IS NOT NULL`` guard to preserve
+            exact NOT IN null semantics (NULL-endpoint edges are dropped, as
+            in legacy and per Cypher).
+        undirected_union_all: (default OFF) O7 — expand undirected traversal
+            as a UNION ALL of two equi-join branches instead of a single
+            non-equi ``ON (e.src = f.node OR e.dst = f.node)`` join (which
+            forces a BroadcastNestedLoopJoin, O(frontier·edges)).
+            Row-identical under the frontier ⊆ visited invariant. Default OFF
+            because on numbered_views the UNION ALL doubles the lazy-lineage
+            fan-out (measured 2–7.7× wall-time regression), and on local-scale
+            temp_tables it was neutral; enable explicitly for materialized
+            execution over large graphs where the BNLJ dominates (isolated
+            benchmark: 4.5s → 0.9s at frontier 1k; legacy does not finish at
+            frontier 50k).
+        loop_control_into: (default ON) numbered_views only — update the WHILE
+            loop-control variable via ``EXECUTE IMMEDIATE '<count query>' INTO
+            var``. The legacy ``EXECUTE IMMEDIATE 'SET var = (...)'`` form is a
+            silent no-op for script locals on OSS Spark 4.2 (writes a conf key
+            instead), so the loop never terminates early and always runs to
+            max_hops, exploding the lazy-view lineage. Measured: 62.8s → 5.3s
+            (11.9×) on a loose bound (*1..8 exhausting at depth 3), costing
+            ~+0.5s absolute on tight bounds.
+        undirected_doubled_adjacency: (default OFF) O8 — materialize the
+            (type/predicate-filtered) edge set once in BOTH orientations
+            (``bfs_adj_{n}``: ``_jk`` = endpoint matched against the
+            frontier, ``_next`` = the other endpoint, plus the ORIGINAL
+            src/dst/property columns unswapped so edge identity in
+            path_edges is preserved); each level then expands with a single
+            equi-join ``e._jk = f.node``. Eliminates the non-equi OR-join
+            (BroadcastNestedLoopJoin, O(frontier·edges)) like
+            ``undirected_union_all``, but references the frontier ONCE per
+            level: on numbered_views the lazy-lineage recursion stays
+            single-branch (~2^depth, parity with legacy — avoiding the
+            measured 2–7.7× per-level-UNION-ALL regression), and on
+            temp_tables it trades a one-time 2|E| write for one hash join
+            per level with the edge filter applied once at build. Mutually
+            exclusive with ``undirected_union_all``. No-op for directed
+            traversal; bidirectional BFS has its own expansion paths and
+            ignores this flag.
+        deferred_edge_payload: (default OFF) O9 — temp_tables only. Copy the
+            (filtered) edge set once into ``bfs_edges_keyed_{n}`` with a
+            materialized ``MONOTONICALLY_INCREASING_ID() AS _row_id``; the
+            per-level ``bfs_edges_{n}``/``bfs_result_{n}`` tables then carry
+            only ``(_row_id, _next_node[, _bfs_depth])`` and the fat edge
+            payload (e.g. serialized-JSON property columns, ~93–99% of row
+            bytes at 1–10KB) is re-attached ONCE in the final view by
+            joining back on ``_row_id``. Only active when the query carries
+            edge property columns. Ignored on numbered_views:
+            MONOTONICALLY_INCREASING_ID over a lazy view is
+            non-deterministic across the multiple re-evaluations
+            (visited/frontier/result), which would silently corrupt
+            results; NV already benefits from lazy column pruning. Side
+            effect (intentional): property columns keep their ORIGINAL
+            types in the final view instead of the legacy all-STRING result
+            table, matching CTE mode. Bidirectional BFS ignores this flag.
+        barrier_precompute: (default OFF) O10 — temp_tables only. Decide the
+            is_terminator barrier once before the loop:
+            ``bfs_barrier_{n}`` = DISTINCT node ids satisfying the barrier
+            predicate (predicate-first + DISTINCT — exactly equivalent to
+            the per-level correlated NOT EXISTS for deterministic
+            predicates); the per-level frontier then anti-joins this small
+            id table instead of re-scanning the full node table every
+            iteration. Skipped (falls back to the per-level form) when the
+            barrier predicate contains a volatile function, which would be
+            frozen at build time. Ignored on numbered_views (a lazy
+            precompute view gains nothing). Bidirectional BFS ignores this
+            flag.
+    """
+
+    # TODO(databricks-validation): these flags exist ONLY because the target
+    # production engine (Databricks SQL Warehouse) could not be tested locally.
+    # After running benchmarks/vlp_memory_investigation/bench_flags_ab*.py on a
+    # real Databricks workspace, resolve each flag and DELETE it together with
+    # its legacy branch:
+    #   - visited_not_exists: if Databricks/Photon confirms no regression,
+    #     remove the flag and the legacy NOT IN branches in
+    #     _tt_visited_not_exists/_nv_visited_not_exists. Local evidence for
+    #     keeping ON: -39% peak execution memory (1.88GB->1.14GB, Q3 directed
+    #     *1..3 numbered_views); with a 20M-row/718MB visited set, NOT IN never
+    #     finishes (unconditional >3.4GiB broadcast, ignores
+    #     autoBroadcastJoinThreshold) vs 7.5s with NOT EXISTS; time-neutral at
+    #     small scale (0.30s vs 0.36s).
+    #   - undirected_union_all: decide per engine. Local evidence: isolated
+    #     materialized benchmark 4.5s->0.9s (5x) at frontier 1k and legacy
+    #     OR-join does not finish at frontier 50k x 2M edges; BUT inside the
+    #     real numbered_views lazy-view pipeline it REGRESSED 2-7.7x
+    #     (ON 11.5s vs OFF 1.49s at *1..4) because two branches double the
+    #     lineage fan-out, and on local temp_tables it was neutral
+    #     (0.84-0.97x) with 2x peak memory. If Databricks (materialized
+    #     temp tables, big frontiers) confirms the win, flip the default to
+    #     True for temp_tables or remove the OR-join branch entirely.
+    #   - loop_control_into: numbered_views only. Local evidence for keeping
+    #     ON: 62.8s->5.3s (11.9x) at *1..8 exhausting at depth 3 (and
+    #     69.9s->2.1s = 33x in the isolated sweep); costs ~+0.5s absolute on
+    #     tight bounds (one real COUNT per level re-evaluates the lazy
+    #     lineage). Verify Databricks' EXECUTE IMMEDIATE 'SET var = ...'
+    #     semantics: if it also fails to assign script locals there, the
+    #     legacy branch is simply a bug and must be deleted.
+    # TODO(databricks-validation): the three flags below (O8/O9/O10) are the
+    # unmeasured-on-Databricks rewrites from the external BFS perf analysis
+    # (2026-07). Local evidence says they are result-preserving; the perf win
+    # can only be confirmed on the real temp_tables target (Databricks SQL
+    # Warehouse). After A/B there (bench_flags_ab_tt.py pattern):
+    #   - undirected_doubled_adjacency: if it beats both the OR-join and
+    #     per-level UNION ALL on materialized temp tables, flip the default
+    #     for temp_tables and delete undirected_union_all; verify with
+    #     EXPLAIN that no BroadcastNestedLoopJoin remains and the frontier
+    #     subtree appears once.
+    #   - deferred_edge_payload: confirm MONOTONICALLY_INCREASING_ID is
+    #     stable on warehouse temp tables, then default ON for wide-payload
+    #     schemas (the keyed copy is O(|E|) — may lose on huge edge tables
+    #     with tiny traversals).
+    #   - barrier_precompute: expected win = replaces up-to-max_hops filtered
+    #     node-table scans with 1 scan + cheap anti-joins; default ON for
+    #     temp_tables if confirmed.
+    visited_not_exists: bool = True
+    undirected_union_all: bool = False
+    loop_control_into: bool = True
+    undirected_doubled_adjacency: bool = True
+    deferred_edge_payload: bool = True
+    barrier_precompute: bool = True
+
+    def __post_init__(self) -> None:
+        if self.undirected_union_all and self.undirected_doubled_adjacency:
+            raise ValueError(
+                "undirected_union_all and undirected_doubled_adjacency are "
+                "mutually exclusive undirected-expansion rewrites; enable "
+                "at most one."
+            )
+
+    @classmethod
+    def all_off(cls) -> "ProceduralBFSOptimizations":
+        """Legacy escape hatch: reproduce the pre-optimization SQL."""
+        return cls(
+            visited_not_exists=False,
+            undirected_union_all=False,
+            loop_control_into=False,
+            undirected_doubled_adjacency=False,
+            deferred_edge_payload=False,
+            barrier_precompute=False,
+        )
+
+
+# Conservative markers for volatile SQL functions in a rendered predicate.
+# Used to skip the barrier precompute (which would freeze one evaluation).
+# A false positive only costs the optimization, never correctness.
+_VOLATILE_SQL_MARKERS: tuple[str, ...] = (
+    "rand(", "randn(", "uuid(", "now(",
+    "current_timestamp", "current_date", "unix_timestamp(",
+)
+
+
+def _sql_contains_volatile_function(predicate: str) -> bool:
+    """Substring check for volatile functions in a rendered SQL predicate."""
+    lowered = predicate.lower()
+    return any(marker in lowered for marker in _VOLATILE_SQL_MARKERS)
+
+
 def _build_bfs_barrier_where(p: "_BFSParams", node_col: str) -> str:
     """Build NOT EXISTS clause for barrier nodes in BFS frontier.
 
@@ -399,31 +578,236 @@ class ProceduralBFSRenderer:
         return None
 
     @staticmethod
-    def _resolve_direction(
+    def _build_where_clause(where_parts: list[str]) -> str:
+        """Build WHERE clause from parts."""
+        return f"\nWHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+    def _direction_branches(
+        self,
         src_col: str,
         dst_col: str,
         is_backward: bool,
         is_undirected: bool,
-    ) -> tuple[str, str, str]:
-        """Return (join_cond, next_node_expr, visited_exclusion_col) for direction."""
+    ) -> list[tuple[str, str]]:
+        """Return ``[(join_cond, next_node_expr), ...]`` for the edge expansion.
+
+        Undirected traversal is emitted as a UNION ALL of **two equi-join
+        branches** (forward: ``e.src = f.node`` → next ``e.dst``; backward:
+        ``e.dst = f.node`` → next ``e.src``) instead of a single non-equi
+        ``ON (e.src = f.node OR e.dst = f.node)`` join. An OR join predicate
+        forces Spark into a BroadcastNestedLoopJoin (O(frontier·edges), which
+        does not scale with frontier size); two equi-joins use hash/sort-merge
+        joins. The two forms are row-for-row identical — for an edge with both
+        endpoints in the frontier the OR-join also matches twice (once per
+        frontier node), yielding the same two rows the UNION ALL produces, and
+        self-loops are filtered by the visited check in both. See
+        docs_help_dev/analysis_canonical_query_bfs_memory.md (O7).
+
+        Gated by ``ProceduralBFSOptimizations.undirected_union_all``; when off,
+        undirected reverts to the legacy single OR-join branch with a CASE
+        next-node expression.
+        """
         if is_undirected:
+            # TODO(databricks-validation): resolve this flag after measuring
+            # on Databricks (materialized temp tables, production-size
+            # frontiers). Local numbers: UNION ALL wins 5x isolated on
+            # materialized tables (4.5s->0.9s at frontier 1k; OR-join never
+            # finishes at frontier 50k x 2M edges) but REGRESSES 2-7.7x inside
+            # numbered_views (lazy lineage doubles per branch) and is neutral
+            # (0.84-0.97x, 2x peak mem) on small local temp_tables. If
+            # Databricks confirms the win, default True for temp_tables (or
+            # delete the OR-join branch); if not, delete the UNION ALL branch.
+            if self._ctx.procedural_optimizations.undirected_union_all:
+                return [
+                    (f"e.{src_col} = f.node", f"e.{dst_col}"),
+                    (f"e.{dst_col} = f.node", f"e.{src_col}"),
+                ]
+            # Legacy: single non-equi OR-join with CASE-based next node.
             join_cond = f"(e.{src_col} = f.node OR e.{dst_col} = f.node)"
             next_node_expr = (
                 f"CASE WHEN f.node = e.{src_col} "
                 f"THEN e.{dst_col} ELSE e.{src_col} END"
             )
-            return join_cond, next_node_expr, next_node_expr
-        elif is_backward:
-            join_cond = f"e.{dst_col} = f.node"
-            return join_cond, f"e.{src_col}", f"e.{src_col}"
-        else:
-            join_cond = f"e.{src_col} = f.node"
-            return join_cond, f"e.{dst_col}", f"e.{dst_col}"
+            return [(join_cond, next_node_expr)]
+        if is_backward:
+            return [(f"e.{dst_col} = f.node", f"e.{src_col}")]
+        return [(f"e.{src_col} = f.node", f"e.{dst_col}")]
 
     @staticmethod
-    def _build_where_clause(where_parts: list[str]) -> str:
-        """Build WHERE clause from parts."""
-        return f"\nWHERE {' AND '.join(where_parts)}" if where_parts else ""
+    def _edge_targets(p: _BFSParams) -> list[tuple[str, str | None]]:
+        """Return ``[(table_sql, filter_clause), ...]`` edge-table targets."""
+        if p.enriched.single_table:
+            return [(p.edge_table_sql, p.edge_type_filter)]
+        return [
+            (ei.table_descriptor.full_table_name, ei.filter_clause)
+            for ei in p.enriched.edge_tables
+        ]
+
+    def _adjacency_active(self, p: _BFSParams) -> bool:
+        """Whether the doubled-adjacency expansion applies to this operator.
+
+        Only for undirected, non-bidirectional traversal; the bidirectional
+        renderers have their own expansion paths and ignore the flag.
+        """
+        return (
+            p.is_undirected
+            and p.bidir_mode == "off"
+            and self._ctx.procedural_optimizations.undirected_doubled_adjacency
+        )
+
+    def _deferral_active(self, p: _BFSParams) -> bool:
+        """Whether the deferred-edge-payload rewrite applies (O9).
+
+        temp_tables only — the ``_row_id`` is stable ONLY because the keyed
+        table is materialized; numbered_views' lazy views would re-evaluate
+        MONOTONICALLY_INCREASING_ID non-deterministically across the
+        visited/frontier/result consumers. Checked explicitly (not just
+        structurally by caller) because ``_adjacency_select_body`` is
+        shared with the numbered_views static-adjacency path (O8+O9
+        compose only under temp_tables). Requires carried edge property
+        columns (otherwise there is no payload to defer); the bidirectional
+        renderers have their own paths and ignore the flag.
+        """
+        return (
+            self._ctx.materialization_strategy == "temp_tables"
+            and p.bidir_mode == "off"
+            and bool(p.edge_prop_cols)
+            and self._ctx.procedural_optimizations.deferred_edge_payload
+        )
+
+    def _barrier_precompute_active(self, p: _BFSParams) -> bool:
+        """Whether the barrier-precompute rewrite applies (O10).
+
+        temp_tables only (a lazy numbered_views precompute gains nothing) —
+        enforced structurally: only the ``_tt_*`` builders consult this.
+        Requires a barrier and a non-volatile predicate (a volatile one
+        would be frozen at build time instead of re-evaluated per level);
+        the bidirectional renderers have their own paths and ignore the
+        flag.
+        """
+        return (
+            p.bidir_mode == "off"
+            and p.barrier_predicate is not None
+            and p.barrier_node_table is not None
+            and p.barrier_node_id_col is not None
+            and self._ctx.procedural_optimizations.barrier_precompute
+            and not _sql_contains_volatile_function(p.barrier_predicate)
+        )
+
+    def _adjacency_select_body(self, p: _BFSParams) -> str:
+        """UNION ALL SELECT doubling each (filtered) edge into both
+        orientations.
+
+        Each branch keeps the ORIGINAL src/dst/property columns unswapped
+        (edge identity for path_edges) and adds ``_jk`` (the endpoint to
+        match against the frontier) and ``_next`` (the other endpoint). Edge
+        type filters and the edge predicate are applied here, once, at build
+        time — the per-level expansion then carries no edge filters. Must
+        not reference any script-local variable (42K0M) — and does not.
+
+        With ``deferred_edge_payload`` the adjacency is built narrow from
+        the keyed copy (``_row_id, _jk, _next`` only; filters were already
+        applied at the keyed build).
+        """
+        if self._deferral_active(p):
+            keyed = f"bfs_edges_keyed_{p.n}"
+            return (
+                f"SELECT e._row_id, "
+                f"e.{p.src_col} AS _jk, e.{p.dst_col} AS _next\n"
+                f"FROM {keyed} e\n"
+                f"UNION ALL\n"
+                f"SELECT e._row_id, "
+                f"e.{p.dst_col} AS _jk, e.{p.src_col} AS _next\n"
+                f"FROM {keyed} e"
+            )
+        prop_select = "".join(f", e.{c}" for c in p.edge_prop_cols)
+        orientations = [
+            f"e.{p.src_col} AS _jk, e.{p.dst_col} AS _next",
+            f"e.{p.dst_col} AS _jk, e.{p.src_col} AS _next",
+        ]
+        parts: list[str] = []
+        for orientation in orientations:
+            for table_sql, table_filter in self._edge_targets(p):
+                where_parts = [
+                    w for w in (table_filter, p.edge_predicate) if w
+                ]
+                parts.append(
+                    f"SELECT e.{p.src_col}, e.{p.dst_col}{prop_select}, "
+                    f"{orientation}\n"
+                    f"FROM {table_sql} e"
+                    + self._build_where_clause(where_parts)
+                )
+        return "\nUNION ALL\n".join(parts)
+
+    def _tt_visited_not_exists(
+        self, visited_table: str, next_expr: str,
+    ) -> str:
+        """Visited-exclusion predicate for temp_tables (fixed table name).
+
+        Emits ``<expr> IS NOT NULL AND NOT EXISTS (SELECT 1 FROM <visited> v
+        WHERE v.node = <expr>)`` instead of ``<expr> NOT IN (SELECT node FROM
+        <visited>)``. ``NOT IN`` is a *null-aware* anti-join that Spark can
+        only run as an unconditional broadcast of the entire visited set
+        (there is no shuffle fallback for a single-column null-aware
+        anti-join, and it ignores ``autoBroadcastJoinThreshold``), so it OOMs
+        the driver once visited grows large in deep BFS. ``NOT EXISTS``
+        degrades to SortMergeJoin.
+
+        The ``IS NOT NULL`` guard is required for exact NOT IN semantics:
+        ``NULL NOT IN (non-empty set)`` yields NULL (row dropped), while
+        ``NOT EXISTS (... v.node = NULL)`` never matches (row kept). Visited
+        is root-seeded and therefore never empty, so legacy NOT IN always
+        drops NULL-endpoint edges; without the guard those edges would leak
+        into visited/frontier/result. Matches Cypher semantics (an edge
+        connects two nodes) and is a free null-filter when endpoints are
+        non-null.
+
+        Gated by ``ProceduralBFSOptimizations.visited_not_exists``; when off,
+        reverts to the legacy ``NOT IN`` form.
+        """
+        # TODO(databricks-validation): delete this legacy NOT IN branch (and
+        # the flag) once Databricks confirms NOT EXISTS is safe there. Local
+        # numbers: NOT EXISTS = -39% peak execution memory; NOT IN broadcasts
+        # the whole visited set unconditionally (>3.4GiB for 20M rows, never
+        # finishes) while NOT EXISTS degrades to SortMergeJoin (7.5s).
+        if not self._ctx.procedural_optimizations.visited_not_exists:
+            return f"{next_expr} NOT IN (SELECT node FROM {visited_table})"
+        return (
+            f"{next_expr} IS NOT NULL "
+            f"AND NOT EXISTS (SELECT 1 FROM {visited_table} v "
+            f"WHERE v.node = {next_expr})"
+        )
+
+    def _nv_visited_not_exists(
+        self, table_base: str, depth_var: str, next_expr: str,
+    ) -> str:
+        """Visited-exclusion predicate for numbered_views.
+
+        Same rewrite as :meth:`_tt_visited_not_exists`, but the visited view is
+        depth-numbered so the suffix is injected via the EXECUTE IMMEDIATE
+        string-concatenation idiom (break out of the quoted literal, concat the
+        depth, resume). See that method for why NOT EXISTS beats NOT IN and
+        why the ``IS NOT NULL`` guard is required (exact NOT IN null
+        semantics). The guard contains no quotes, so escaping is unaffected.
+
+        Gated by ``ProceduralBFSOptimizations.visited_not_exists``; when off,
+        reverts to the legacy ``NOT IN`` form.
+        """
+        # TODO(databricks-validation): delete this legacy NOT IN branch (and
+        # the flag) once Databricks confirms NOT EXISTS is safe there. Same
+        # evidence as _tt_visited_not_exists (-39% peak memory; anti-OOM).
+        if not self._ctx.procedural_optimizations.visited_not_exists:
+            return (
+                f"{next_expr} NOT IN ("
+                f"SELECT node FROM {table_base}_'"
+                f" || CAST({depth_var} - 1 AS STRING) || ')"
+            )
+        return (
+            f"{next_expr} IS NOT NULL "
+            f"AND NOT EXISTS (SELECT 1 FROM {table_base}_'"
+            f" || CAST({depth_var} - 1 AS STRING) || ' v "
+            f"WHERE v.node = {next_expr})"
+        )
 
     @staticmethod
     def _build_path_edges_expr(p: _BFSParams, alias: str = "r") -> str:
@@ -476,6 +860,32 @@ class ProceduralBFSRenderer:
             f"DECLARE rows_in_frontier_{p.n} BIGINT DEFAULT 1;"
         )
 
+    def _tt_keyed_edges_select(self, p: _BFSParams) -> str:
+        """SELECT body for the keyed edge copy (payload deferral, O9).
+
+        ``MONOTONICALLY_INCREASING_ID()`` is assigned once and frozen by the
+        temp-table materialization; every per-level table then references
+        rows by ``_row_id`` and the payload is re-attached once in the final
+        view. Do NOT key by a schema edge-id property instead: EdgeSchema
+        carries no uniqueness metadata, and a duplicated id would fan out
+        the final re-attach join. Edge type filters and the edge predicate
+        are applied here, once.
+        """
+        prop_select = "".join(f", e.{c}" for c in p.edge_prop_cols)
+        parts: list[str] = []
+        for table_sql, table_filter in self._edge_targets(p):
+            where_parts = [w for w in (table_filter, p.edge_predicate) if w]
+            parts.append(
+                f"SELECT e.{p.src_col}, e.{p.dst_col}{prop_select}\n"
+                f"FROM {table_sql} e"
+                + self._build_where_clause(where_parts)
+            )
+        union = "\nUNION ALL\n".join(parts)
+        return (
+            f"SELECT e.*, MONOTONICALLY_INCREASING_ID() AS _row_id\n"
+            f"FROM (\n{union}\n) e"
+        )
+
     def _tt_setup(self, p: _BFSParams) -> str:
         """Create initial temp tables: visited, frontier, result, frontier_init."""
         prop_cols_def = "".join(
@@ -486,11 +896,51 @@ class ProceduralBFSRenderer:
         lines: list[str] = []
 
         # Drop pre-existing tables
-        for name in [
+        drop_names = [
             f"bfs_visited_{p.n}", f"bfs_frontier_{p.n}",
             f"bfs_result_{p.n}", f"bfs_frontier_{p.n}_init",
-        ]:
+        ]
+        if self._deferral_active(p):
+            drop_names.append(f"bfs_edges_keyed_{p.n}")
+        if self._adjacency_active(p):
+            drop_names.append(f"bfs_adj_{p.n}")
+        if self._barrier_precompute_active(p):
+            drop_names.append(f"bfs_barrier_{p.n}")
+        for name in drop_names:
             lines.append(f"DROP TEMPORARY TABLE IF EXISTS {name};")
+
+        # Barrier decision: materialized once, before the loop (O10).
+        # Predicate-first + DISTINCT — exactly the per-level correlated
+        # NOT EXISTS semantics ("node is a barrier iff ANY node-table row
+        # with that id satisfies type filter + predicate"). Never rewrite
+        # this as aggregate-then-predicate (e.g. MAX(col) > x): that is
+        # only equivalent for monotone predicates.
+        if self._barrier_precompute_active(p):
+            barrier_parts: list[str] = []
+            if p.barrier_node_type_filter:
+                barrier_parts.append(p.barrier_node_type_filter)
+            barrier_parts.append(f"({p.barrier_predicate})")
+            lines.append(
+                f"CREATE TEMPORARY TABLE bfs_barrier_{p.n} AS\n"
+                f"SELECT DISTINCT barrier.{p.barrier_node_id_col} AS node\n"
+                f"FROM {p.barrier_node_table} barrier\n"
+                f"WHERE {' AND '.join(barrier_parts)};"
+            )
+
+        # Keyed edge copy: materialized once, before the loop (O9). Must
+        # precede the adjacency, which is built from it when both are on.
+        if self._deferral_active(p):
+            lines.append(
+                f"CREATE TEMPORARY TABLE bfs_edges_keyed_{p.n} AS\n"
+                f"{self._tt_keyed_edges_select(p)};"
+            )
+
+        # Doubled adjacency: materialized once, before the loop (O8)
+        if self._adjacency_active(p):
+            lines.append(
+                f"CREATE TEMPORARY TABLE bfs_adj_{p.n} AS\n"
+                f"{self._adjacency_select_body(p)};"
+            )
 
         # Visited (accumulator)
         lines.append(
@@ -507,12 +957,20 @@ class ProceduralBFSRenderer:
             f"INSERT INTO bfs_visited_{p.n}\n"
             f"SELECT node FROM bfs_frontier_{p.n};"
         )
-        # Result accumulator (empty, matching edge schema)
-        lines.append(
-            f"CREATE TEMPORARY TABLE bfs_result_{p.n} "
-            f"({p.src_col} STRING, {p.dst_col} STRING{prop_cols_def}, "
-            f"_next_node STRING, _bfs_depth INT);"
-        )
+        # Result accumulator (empty). With payload deferral it carries only
+        # the row key + next node; otherwise it matches the edge schema
+        # (legacy: all property columns as STRING).
+        if self._deferral_active(p):
+            lines.append(
+                f"CREATE TEMPORARY TABLE bfs_result_{p.n} "
+                f"(_row_id BIGINT, _next_node STRING, _bfs_depth INT);"
+            )
+        else:
+            lines.append(
+                f"CREATE TEMPORARY TABLE bfs_result_{p.n} "
+                f"({p.src_col} STRING, {p.dst_col} STRING{prop_cols_def}, "
+                f"_next_node STRING, _bfs_depth INT);"
+            )
         # Save frontier_0 for CROSS JOIN in final view
         lines.append(
             f"CREATE TEMPORARY TABLE bfs_frontier_{p.n}_init AS\n"
@@ -522,65 +980,70 @@ class ProceduralBFSRenderer:
         return "\n".join(lines)
 
     def _tt_edge_expansion_sql(self, p: _BFSParams) -> str:
-        """Build edge expansion SELECT for temp_tables (no quote escaping needed)."""
-        join_cond, next_node_expr, visited_excl = self._resolve_direction(
+        """Build edge expansion SELECT for temp_tables (no quote escaping).
+
+        Emits a ``UNION ALL`` over (direction branch × edge table): undirected
+        traversal contributes two equi-join branches when
+        ``undirected_union_all`` is on (see :meth:`_direction_branches`), and
+        a multi-table edge schema contributes one part per physical table.
+        With ``undirected_doubled_adjacency`` the whole expansion collapses
+        to a single equi-join against the pre-built ``bfs_adj_{n}`` (filters
+        were applied at build time).
+        """
+        prop_select = "".join(f", e.{c}" for c in p.edge_prop_cols)
+        deferred = self._deferral_active(p)
+
+        if self._adjacency_active(p):
+            visited = self._tt_visited_not_exists(
+                f"bfs_visited_{p.n}", "e._next",
+            )
+            select_cols = (
+                "e._row_id" if deferred
+                else f"e.{p.src_col}, e.{p.dst_col}{prop_select}"
+            )
+            return (
+                f"SELECT {select_cols}, e._next AS _next_node\n"
+                f"FROM bfs_adj_{p.n} e\n"
+                f"INNER JOIN bfs_frontier_{p.n} f ON e._jk = f.node\n"
+                f"WHERE {visited}"
+            )
+
+        branches = self._direction_branches(
             p.src_col, p.dst_col, p.is_backward, p.is_undirected,
         )
-        prop_select = "".join(f", e.{c}" for c in p.edge_prop_cols)
+        if deferred:
+            # Expansion reads the keyed copy: filters/predicate were
+            # applied at its build; only the row key travels per level.
+            targets: list[tuple[str, str | None]] = [
+                (f"bfs_edges_keyed_{p.n}", None),
+            ]
+            select_prefix = "e._row_id"
+            edge_predicate = None
+        else:
+            targets = self._edge_targets(p)
+            select_prefix = f"e.{p.src_col}, e.{p.dst_col}{prop_select}"
+            edge_predicate = p.edge_predicate
 
-        if not p.enriched.single_table:
-            return self._tt_multi_table_edge_expansion(
-                p, join_cond, next_node_expr, visited_excl,
-            )
-
-        where_parts: list[str] = []
-        where_parts.append(
-            f"{visited_excl} NOT IN (SELECT node FROM bfs_visited_{p.n})"
-        )
-        if p.edge_type_filter:
-            where_parts.append(p.edge_type_filter)
-        if p.edge_predicate:
-            where_parts.append(p.edge_predicate)
-
-        return (
-            f"SELECT "
-            f"e.{p.src_col}, e.{p.dst_col}{prop_select}, "
-            f"{next_node_expr} AS _next_node\n"
-            f"FROM {p.edge_table_sql} e\n"
-            f"INNER JOIN bfs_frontier_{p.n} f ON {join_cond}"
-            + self._build_where_clause(where_parts)
-        )
-
-    def _tt_multi_table_edge_expansion(
-        self,
-        p: _BFSParams,
-        join_cond: str,
-        next_node_expr: str,
-        visited_excl: str,
-    ) -> str:
-        """UNION ALL edge expansion for multiple edge tables (temp_tables)."""
-        prop_select = "".join(f", e.{c}" for c in p.edge_prop_cols)
         parts: list[str] = []
-
-        for edge_info in p.enriched.edge_tables:
-            table_name = edge_info.table_descriptor.full_table_name
-            where_parts: list[str] = []
-            where_parts.append(
-                f"{visited_excl} NOT IN (SELECT node FROM bfs_visited_{p.n})"
-            )
-            if edge_info.filter_clause:
-                where_parts.append(edge_info.filter_clause)
-            if p.edge_predicate:
-                where_parts.append(p.edge_predicate)
-
-            parts.append(
-                f"SELECT "
-                f"e.{p.src_col}, e.{p.dst_col}{prop_select}, "
-                f"{next_node_expr} AS _next_node\n"
-                f"FROM {table_name} e\n"
-                f"INNER JOIN bfs_frontier_{p.n} f ON {join_cond}"
-                + self._build_where_clause(where_parts)
-            )
+        for join_cond, next_expr in branches:
+            for table_sql, table_filter in targets:
+                where_parts: list[str] = [
+                    self._tt_visited_not_exists(
+                        f"bfs_visited_{p.n}", next_expr,
+                    )
+                ]
+                if table_filter:
+                    where_parts.append(table_filter)
+                if edge_predicate:
+                    where_parts.append(edge_predicate)
+                parts.append(
+                    f"SELECT "
+                    f"{select_prefix}, "
+                    f"{next_expr} AS _next_node\n"
+                    f"FROM {table_sql} e\n"
+                    f"INNER JOIN bfs_frontier_{p.n} f ON {join_cond}"
+                    + self._build_where_clause(where_parts)
+                )
 
         return "\nUNION ALL\n".join(parts)
 
@@ -622,7 +1085,15 @@ class ProceduralBFSRenderer:
         # Replace frontier: DROP + CREATE TABLE AS
         lines.append(f"    DROP TEMPORARY TABLE bfs_frontier_{p.n};")
         if p.barrier_predicate and p.barrier_node_table:
-            barrier_where = _build_bfs_barrier_where(p, "_next_node")
+            if self._barrier_precompute_active(p):
+                # Anti-join the small precomputed id table (O10) instead
+                # of probing the full node table every level.
+                barrier_where = (
+                    f"NOT EXISTS (SELECT 1 FROM bfs_barrier_{p.n} b "
+                    f"WHERE b.node = _next_node)"
+                )
+            else:
+                barrier_where = _build_bfs_barrier_where(p, "_next_node")
             lines.append(
                 f"    CREATE TEMPORARY TABLE bfs_frontier_{p.n} AS\n"
                 f"    SELECT DISTINCT _next_node AS node "
@@ -659,13 +1130,21 @@ class ProceduralBFSRenderer:
         return "\n".join(lines)
 
     def _tt_final_view(self, p: _BFSParams) -> str:
-        """Build final result view for temp_tables strategy."""
-        prop_cols = "".join(f", r.{c}" for c in p.edge_prop_cols)
+        """Build final result view for temp_tables strategy.
+
+        With ``deferred_edge_payload`` the edge columns come from the keyed
+        copy via a single re-attach join on ``_row_id`` (and keep their
+        ORIGINAL schema types); otherwise from the result accumulator
+        (legacy: all-STRING columns).
+        """
+        deferred = self._deferral_active(p)
+        edge_alias = "e" if deferred else "r"
+        prop_cols = "".join(f", {edge_alias}.{c}" for c in p.edge_prop_cols)
 
         # path_edges: ARRAY(NAMED_STRUCT(...)) wrapping one edge per row
         path_edges_col = ""
         if p.collect_edges:
-            path_edges_expr = self._build_path_edges_expr(p, alias="r")
+            path_edges_expr = self._build_path_edges_expr(p, alias=edge_alias)
             path_edges_col = f",\n       {path_edges_expr} AS path_edges"
 
         # Only emit path column when collect_nodes is True
@@ -675,15 +1154,27 @@ class ProceduralBFSRenderer:
                 ",\n       CAST(NULL AS ARRAY<STRING>) AS path"
             )
 
+        if deferred:
+            from_clause = (
+                f"FROM bfs_result_{p.n} r\n"
+                f"JOIN bfs_edges_keyed_{p.n} e ON e._row_id = r._row_id\n"
+                f"CROSS JOIN bfs_frontier_{p.n}_init f0;"
+            )
+        else:
+            from_clause = (
+                f"FROM bfs_result_{p.n} r\n"
+                f"CROSS JOIN bfs_frontier_{p.n}_init f0;"
+            )
+
         return (
             f"CREATE OR REPLACE TEMPORARY VIEW {p.cte_name} AS\n"
             f"SELECT f0.node AS start_node, r._next_node AS end_node, "
             f"r._bfs_depth AS depth,\n"
-            f"       r.{p.src_col}, r.{p.dst_col}{prop_cols}"
+            f"       {edge_alias}.{p.src_col}, "
+            f"{edge_alias}.{p.dst_col}{prop_cols}"
             f"{path_edges_col}"
             f"{path_col}\n"
-            f"FROM bfs_result_{p.n} r\n"
-            f"CROSS JOIN bfs_frontier_{p.n}_init f0;"
+            f"{from_clause}"
         )
 
     # ======================================================================
@@ -726,7 +1217,7 @@ class ProceduralBFSRenderer:
         if p.is_undirected:
             bwd_is_backward = False  # undirected stays undirected
 
-        bwd_join, bwd_next, bwd_excl = self._resolve_direction(
+        bwd_branches = self._direction_branches(
             p.src_col, p.dst_col, bwd_is_backward, p.is_undirected,
         )
 
@@ -774,7 +1265,7 @@ class ProceduralBFSRenderer:
 
         # Edge expansion (backward direction, no result cols)
         bwd_edge_sql = self._tt_bidir_backward_edge_sql(
-            p, bwd_join, bwd_next, bwd_excl,
+            p, bwd_branches,
         )
 
         lines.append(
@@ -830,19 +1321,11 @@ class ProceduralBFSRenderer:
         )
         lines.append("")
 
-        # Pruning condition: _next_node in backward reachable set
-        join_cond, next_node_expr, _ = self._resolve_direction(
-            p.src_col, p.dst_col,
-            p.is_backward, p.is_undirected,
-        )
-        prune_cond = (
-            f"{next_node_expr} IN "
-            f"(SELECT node FROM bfs_bwd_visited_{p.n})"
-        )
-
-        # Build edge expansion SQL for pruned and unpruned
+        # Build edge expansion SQL for pruned and unpruned. Pruning restricts
+        # next-nodes to the backward-reachable set (per branch inside the
+        # forward edge builder).
         pruned_sql = self._tt_bidir_forward_edge_sql(
-            p, extra_where=[prune_cond],
+            p, prune_against=f"bfs_bwd_visited_{p.n}",
         )
         unpruned_sql = self._tt_bidir_forward_edge_sql(p)
 
@@ -929,120 +1412,96 @@ class ProceduralBFSRenderer:
     def _tt_bidir_backward_edge_sql(
         self,
         p: _BFSParams,
-        bwd_join: str,
-        bwd_next: str,
-        bwd_excl: str,
+        branches: list[tuple[str, str]],
     ) -> str:
         """Build backward edge expansion SQL for temp_tables bidir.
 
-        Handles both single-table and multi-table edge schemas.
-        Returns only _next_node (no result columns needed).
+        UNION ALL over (direction branch × edge table); undirected backward
+        traversal contributes two equi-join branches (see
+        :meth:`_direction_branches`). Returns only _next_node (no result cols).
         """
-        if not p.enriched.single_table:
-            parts: list[str] = []
-            for edge_info in p.enriched.edge_tables:
-                table_name = (
-                    edge_info.table_descriptor.full_table_name
-                )
+        if p.enriched.single_table:
+            targets = [(p.edge_table_sql, p.edge_type_filter)]
+        else:
+            targets = [
+                (ei.table_descriptor.full_table_name, ei.filter_clause)
+                for ei in p.enriched.edge_tables
+            ]
+
+        parts: list[str] = []
+        for bwd_join, bwd_next in branches:
+            for table_sql, table_filter in targets:
                 where_parts: list[str] = [
-                    f"{bwd_excl} NOT IN "
-                    f"(SELECT node FROM bfs_bwd_visited_{p.n})"
+                    self._tt_visited_not_exists(
+                        f"bfs_bwd_visited_{p.n}", bwd_next,
+                    )
                 ]
-                if edge_info.filter_clause:
-                    where_parts.append(edge_info.filter_clause)
+                if table_filter:
+                    where_parts.append(table_filter)
                 if p.edge_predicate:
                     where_parts.append(p.edge_predicate)
                 parts.append(
                     f"SELECT DISTINCT {bwd_next} AS _next_node\n"
-                    f"FROM {table_name} e\n"
-                    f"INNER JOIN bfs_bwd_frontier_{p.n} f "
-                    f"ON {bwd_join}"
+                    f"FROM {table_sql} e\n"
+                    f"INNER JOIN bfs_bwd_frontier_{p.n} f ON {bwd_join}"
                     + self._build_where_clause(where_parts)
                 )
-            return "\nUNION ALL\n".join(parts)
 
-        where_parts = [
-            f"{bwd_excl} NOT IN "
-            f"(SELECT node FROM bfs_bwd_visited_{p.n})"
-        ]
-        if p.edge_type_filter:
-            where_parts.append(p.edge_type_filter)
-        if p.edge_predicate:
-            where_parts.append(p.edge_predicate)
-        return (
-            f"SELECT DISTINCT {bwd_next} AS _next_node\n"
-            f"FROM {p.edge_table_sql} e\n"
-            f"INNER JOIN bfs_bwd_frontier_{p.n} f "
-            f"ON {bwd_join}"
-            + self._build_where_clause(where_parts)
-        )
+        return "\nUNION ALL\n".join(parts)
 
     def _tt_bidir_forward_edge_sql(
         self,
         p: _BFSParams,
-        extra_where: list[str] | None = None,
+        prune_against: str | None = None,
     ) -> str:
         """Build forward edge expansion SQL for temp_tables bidir.
 
-        Handles both single-table and multi-table edge schemas.
-        Optionally adds extra_where conditions (e.g. pruning).
+        UNION ALL over (direction branch × edge table); undirected traversal
+        contributes two equi-join branches (see :meth:`_direction_branches`).
+        When ``prune_against`` is a table name, each branch is restricted to
+        next-nodes in that backward-reachable set — built per branch from the
+        branch's own next-node column so no CASE expression is needed.
         """
-        join_cond, next_node_expr, visited_excl = (
-            self._resolve_direction(
-                p.src_col, p.dst_col,
-                p.is_backward, p.is_undirected,
-            )
+        branches = self._direction_branches(
+            p.src_col, p.dst_col, p.is_backward, p.is_undirected,
         )
-        prop_select = "".join(
-            f", e.{c}" for c in p.edge_prop_cols
-        )
-        extra = extra_where or []
+        prop_select = "".join(f", e.{c}" for c in p.edge_prop_cols)
 
-        if not p.enriched.single_table:
-            parts: list[str] = []
-            for edge_info in p.enriched.edge_tables:
-                table_name = (
-                    edge_info.table_descriptor.full_table_name
-                )
+        if p.enriched.single_table:
+            targets = [(p.edge_table_sql, p.edge_type_filter)]
+        else:
+            targets = [
+                (ei.table_descriptor.full_table_name, ei.filter_clause)
+                for ei in p.enriched.edge_tables
+            ]
+
+        parts: list[str] = []
+        for join_cond, next_expr in branches:
+            for table_sql, table_filter in targets:
                 where_parts: list[str] = [
-                    f"{visited_excl} NOT IN "
-                    f"(SELECT node FROM bfs_visited_{p.n})"
+                    self._tt_visited_not_exists(
+                        f"bfs_visited_{p.n}", next_expr,
+                    )
                 ]
-                if edge_info.filter_clause:
-                    where_parts.append(edge_info.filter_clause)
+                if table_filter:
+                    where_parts.append(table_filter)
                 if p.edge_predicate:
                     where_parts.append(p.edge_predicate)
-                where_parts.extend(extra)
+                if prune_against:
+                    where_parts.append(
+                        f"{next_expr} IN "
+                        f"(SELECT node FROM {prune_against})"
+                    )
                 parts.append(
                     f"SELECT "
-                    f"e.{p.src_col}, e.{p.dst_col}"
-                    f"{prop_select}, "
-                    f"{next_node_expr} AS _next_node\n"
-                    f"FROM {table_name} e\n"
-                    f"INNER JOIN bfs_frontier_{p.n} f "
-                    f"ON {join_cond}"
+                    f"e.{p.src_col}, e.{p.dst_col}{prop_select}, "
+                    f"{next_expr} AS _next_node\n"
+                    f"FROM {table_sql} e\n"
+                    f"INNER JOIN bfs_frontier_{p.n} f ON {join_cond}"
                     + self._build_where_clause(where_parts)
                 )
-            return "\nUNION ALL\n".join(parts)
 
-        where_parts = [
-            f"{visited_excl} NOT IN "
-            f"(SELECT node FROM bfs_visited_{p.n})"
-        ]
-        if p.edge_type_filter:
-            where_parts.append(p.edge_type_filter)
-        if p.edge_predicate:
-            where_parts.append(p.edge_predicate)
-        where_parts.extend(extra)
-        return (
-            f"SELECT "
-            f"e.{p.src_col}, e.{p.dst_col}{prop_select}, "
-            f"{next_node_expr} AS _next_node\n"
-            f"FROM {p.edge_table_sql} e\n"
-            f"INNER JOIN bfs_frontier_{p.n} f "
-            f"ON {join_cond}"
-            + self._build_where_clause(where_parts)
-        )
+        return "\nUNION ALL\n".join(parts)
 
     # ======================================================================
     # STRATEGY: numbered_views (PySpark 4.2)
@@ -1055,6 +1514,8 @@ class ProceduralBFSRenderer:
         body_parts: list[str] = []
         body_parts.append(self._nv_frontier_init(p))
         body_parts.append(self._nv_visited_init(p))
+        if self._adjacency_active(p):
+            body_parts.append(self._nv_adjacency_init(p))
         body_parts.append(self._nv_while_loop(p))
         body_parts.append(self._nv_final_view(p))
 
@@ -1085,86 +1546,77 @@ class ProceduralBFSRenderer:
             f"SELECT node FROM bfs_frontier_{p.n}_0;"
         )
 
-    def _nv_edge_expansion_sql(self, p: _BFSParams) -> str:
-        """Build edge expansion SELECT for numbered_views (quotes doubled for EXECUTE IMMEDIATE)."""
-        join_cond, next_node_expr, visited_excl = self._resolve_direction(
-            p.src_col, p.dst_col, p.is_backward, p.is_undirected,
-        )
-        prop_select = "".join(f", e.{c}" for c in p.edge_prop_cols)
+    def _nv_adjacency_init(self, p: _BFSParams) -> str:
+        """Create the static doubled-adjacency view (pre-loop, O8).
 
-        if not p.enriched.single_table:
-            return self._nv_multi_table_edge_expansion(
-                p, join_cond, next_node_expr, visited_excl,
-            )
-
-        # WHERE conditions (inside EXECUTE IMMEDIATE — quotes must be doubled)
-        where_parts: list[str] = []
-        where_parts.append(
-            f"{visited_excl} NOT IN ("
-            f"SELECT node FROM bfs_visited_{p.n}_'"
-            f" || CAST(bfs_depth_{p.n} - 1 AS STRING) || ')"
-        )
-        if p.edge_type_filter:
-            escaped_filter = p.edge_type_filter.replace("'", "''")
-            where_parts.append(escaped_filter)
-        if p.edge_predicate:
-            escaped_pred = p.edge_predicate.replace("'", "''")
-            where_parts.append(escaped_pred)
-
-        where_clause = " AND ".join(where_parts)
-
+        The view name is fixed (not depth-numbered), so this is a plain
+        statement — no EXECUTE IMMEDIATE, no quote escaping, no locals
+        (42K0M-safe). The view is lazy but constant-depth: each per-level
+        expansion references it once, keeping the recursive lineage
+        single-branch (unlike per-level UNION ALL, which doubles it).
+        """
         return (
-            f"SELECT "
-            f"e.{p.src_col}, e.{p.dst_col}{prop_select}, "
-            f"{next_node_expr} AS _next_node, "
-            f"' || CAST(bfs_depth_{p.n} AS STRING) || ' AS _bfs_depth "
-            f"FROM {p.edge_table_sql} e "
-            f"INNER JOIN bfs_frontier_{p.n}_'"
-            f" || CAST(bfs_depth_{p.n} - 1 AS STRING) || ' f "
-            f"ON {join_cond} "
-            f"WHERE {where_clause}"
+            f"CREATE OR REPLACE TEMPORARY VIEW bfs_adj_{p.n} AS\n"
+            f"{self._adjacency_select_body(p)};"
         )
 
-    def _nv_multi_table_edge_expansion(
-        self,
-        p: _BFSParams,
-        join_cond: str,
-        next_node_expr: str,
-        visited_excl: str,
-    ) -> str:
-        """UNION ALL edge expansion for multiple edge tables (numbered_views)."""
+    def _nv_edge_expansion_sql(self, p: _BFSParams) -> str:
+        """Build edge expansion SELECT for numbered_views (quotes doubled).
+
+        Emits a ``UNION ALL`` over (direction branch × edge table), same as the
+        temp_tables path (see :meth:`_tt_edge_expansion_sql`), but with the
+        depth-numbered frontier/visited view names injected via the EXECUTE
+        IMMEDIATE string-concatenation idiom. With
+        ``undirected_doubled_adjacency`` the expansion is a single equi-join
+        against the static ``bfs_adj_{n}`` view (filters applied there).
+        """
         prop_select = "".join(f", e.{c}" for c in p.edge_prop_cols)
-        parts: list[str] = []
 
-        base_visited = (
-            f"{visited_excl} NOT IN ("
-            f"SELECT node FROM bfs_visited_{p.n}_'"
-            f" || CAST(bfs_depth_{p.n} - 1 AS STRING) || ')"
-        )
-
-        for edge_info in p.enriched.edge_tables:
-            table_name = edge_info.table_descriptor.full_table_name
-            where_parts: list[str] = [base_visited]
-            if edge_info.filter_clause:
-                escaped = edge_info.filter_clause.replace("'", "''")
-                where_parts.append(escaped)
-            if p.edge_predicate:
-                escaped_pred = p.edge_predicate.replace("'", "''")
-                where_parts.append(escaped_pred)
-
-            where_clause = " AND ".join(where_parts)
-
-            parts.append(
-                f"SELECT "
-                f"e.{p.src_col}, e.{p.dst_col}{prop_select}, "
-                f"{next_node_expr} AS _next_node, "
+        if self._adjacency_active(p):
+            visited = self._nv_visited_not_exists(
+                f"bfs_visited_{p.n}", f"bfs_depth_{p.n}", "e._next",
+            )
+            return (
+                f"SELECT e.{p.src_col}, e.{p.dst_col}{prop_select}, "
+                f"e._next AS _next_node, "
                 f"' || CAST(bfs_depth_{p.n} AS STRING) || ' AS _bfs_depth "
-                f"FROM {table_name} e "
+                f"FROM bfs_adj_{p.n} e "
                 f"INNER JOIN bfs_frontier_{p.n}_'"
                 f" || CAST(bfs_depth_{p.n} - 1 AS STRING) || ' f "
-                f"ON {join_cond} "
-                f"WHERE {where_clause}"
+                f"ON e._jk = f.node "
+                f"WHERE {visited}"
             )
+
+        branches = self._direction_branches(
+            p.src_col, p.dst_col, p.is_backward, p.is_undirected,
+        )
+        targets = self._edge_targets(p)
+
+        parts: list[str] = []
+        for join_cond, next_expr in branches:
+            for table_sql, table_filter in targets:
+                where_parts: list[str] = [
+                    self._nv_visited_not_exists(
+                        f"bfs_visited_{p.n}", f"bfs_depth_{p.n}", next_expr,
+                    )
+                ]
+                if table_filter:
+                    where_parts.append(table_filter.replace("'", "''"))
+                if p.edge_predicate:
+                    where_parts.append(p.edge_predicate.replace("'", "''"))
+
+                where_clause = " AND ".join(where_parts)
+                parts.append(
+                    f"SELECT "
+                    f"e.{p.src_col}, e.{p.dst_col}{prop_select}, "
+                    f"{next_expr} AS _next_node, "
+                    f"' || CAST(bfs_depth_{p.n} AS STRING) || ' AS _bfs_depth "
+                    f"FROM {table_sql} e "
+                    f"INNER JOIN bfs_frontier_{p.n}_'"
+                    f" || CAST(bfs_depth_{p.n} - 1 AS STRING) || ' f "
+                    f"ON {join_cond} "
+                    f"WHERE {where_clause}"
+                )
 
         return " UNION ALL ".join(parts)
 
@@ -1188,13 +1640,35 @@ class ProceduralBFSRenderer:
         )
         lines.append("")
 
-        # B. Check frontier size (SET via EXECUTE IMMEDIATE)
-        lines.append(
-            f"  EXECUTE IMMEDIATE\n"
-            f"    'SET bfs_frontier_count_{p.n} = (SELECT COUNT(1)"
-            f" FROM bfs_edges_{p.n}_'"
-            f" || CAST(bfs_depth_{p.n} AS STRING) || ')';"
-        )
+        # B. Check frontier size (EXECUTE IMMEDIATE ... INTO local variable).
+        # NOTE: `EXECUTE IMMEDIATE 'SET var = (...)'` does NOT assign the
+        # script-local variable on Spark 4.2 — it silently writes a session
+        # conf key of the same name, leaving `var` at its DECLARE default. That
+        # makes `WHILE bfs_frontier_count > 0` never terminate early, so the
+        # loop always runs to max_hops and the lazy-view lineage explodes
+        # (~2^max_hops). The `... INTO var` form assigns the local correctly.
+        # Gated by ProceduralBFSOptimizations.loop_control_into.
+        # TODO(databricks-validation): check whether Databricks' EXECUTE
+        # IMMEDIATE 'SET var = ...' assigns script locals. If it is a no-op
+        # there too (as on OSS Spark 4.2), the legacy branch below is simply a
+        # bug — delete it and the flag. Local numbers for INTO: 62.8s->5.3s
+        # (11.9x) at *1..8 exhausting at depth 3; costs ~+0.5s on tight
+        # bounds (one real COUNT per level re-evaluates the lazy lineage).
+        if self._ctx.procedural_optimizations.loop_control_into:
+            lines.append(
+                f"  EXECUTE IMMEDIATE\n"
+                f"    'SELECT COUNT(1) FROM bfs_edges_{p.n}_'"
+                f" || CAST(bfs_depth_{p.n} AS STRING)"
+                f" INTO bfs_frontier_count_{p.n};"
+            )
+        else:
+            # Legacy form (silent no-op for the local on OSS Spark 4.2).
+            lines.append(
+                f"  EXECUTE IMMEDIATE\n"
+                f"    'SET bfs_frontier_count_{p.n} = (SELECT COUNT(1)"
+                f" FROM bfs_edges_{p.n}_'"
+                f" || CAST(bfs_depth_{p.n} AS STRING) || ')';"
+            )
         lines.append("")
 
         # C. Update visited, frontier, union (only if edges found)
@@ -1379,7 +1853,7 @@ class ProceduralBFSRenderer:
         if p.is_undirected:
             bwd_is_backward = False
 
-        bwd_join, bwd_next, bwd_excl = self._resolve_direction(
+        bwd_branches = self._direction_branches(
             p.src_col, p.dst_col, bwd_is_backward, p.is_undirected,
         )
 
@@ -1417,7 +1891,7 @@ class ProceduralBFSRenderer:
 
         # Edge expansion via EXECUTE IMMEDIATE
         bwd_edge_sql = self._nv_bidir_backward_edge_sql(
-            p, bwd_join, bwd_next, bwd_excl,
+            p, bwd_branches,
         )
         lines.append(
             f"  EXECUTE IMMEDIATE\n"
@@ -1520,18 +1994,8 @@ class ProceduralBFSRenderer:
         After depth_forward, adds pruning condition:
         _next_node IN (SELECT node FROM bfs_bwd_reachable_{n})
         """
-        join_cond, next_node_expr, _ = self._resolve_direction(
-            p.src_col, p.dst_col,
-            p.is_backward, p.is_undirected,
-        )
-
-        prune_cond = (
-            f"{next_node_expr} IN "
-            f"(SELECT node FROM bfs_bwd_reachable_{p.n})"
-        )
-
         pruned_sql = self._nv_bidir_forward_edge_sql(
-            p, extra_where=[prune_cond],
+            p, prune_against=f"bfs_bwd_reachable_{p.n}",
         )
         unpruned_sql = self._nv_bidir_forward_edge_sql(p)
 
@@ -1668,40 +2132,39 @@ class ProceduralBFSRenderer:
     def _nv_bidir_backward_edge_sql(
         self,
         p: _BFSParams,
-        bwd_join: str,
-        bwd_next: str,
-        bwd_excl: str,
+        branches: list[tuple[str, str]],
     ) -> str:
         """Build backward edge expansion SQL for nv bidir.
 
-        Handles single-table and multi-table. Quotes doubled
-        for EXECUTE IMMEDIATE.
+        UNION ALL over (direction branch × edge table); undirected backward
+        traversal contributes two equi-join branches. Quotes doubled for
+        EXECUTE IMMEDIATE.
         """
-        bwd_visited_ref = (
-            f"{bwd_excl} NOT IN ("
-            f"SELECT node FROM bfs_bwd_visited_{p.n}_'"
-            f" || CAST(bwd_depth_{p.n} - 1"
-            f" AS STRING) || ')"
-        )
         frontier_ref = (
             f"bfs_bwd_frontier_{p.n}_'"
             f" || CAST(bwd_depth_{p.n} - 1"
             f" AS STRING) || '"
         )
 
-        if not p.enriched.single_table:
-            parts: list[str] = []
-            for ei in p.enriched.edge_tables:
-                tbl = ei.table_descriptor.full_table_name
+        if p.enriched.single_table:
+            targets = [(p.edge_table_sql, p.edge_type_filter)]
+        else:
+            targets = [
+                (ei.table_descriptor.full_table_name, ei.filter_clause)
+                for ei in p.enriched.edge_tables
+            ]
+
+        parts: list[str] = []
+        for bwd_join, bwd_next in branches:
+            bwd_visited_ref = self._nv_visited_not_exists(
+                f"bfs_bwd_visited_{p.n}", f"bwd_depth_{p.n}", bwd_next,
+            )
+            for tbl, table_filter in targets:
                 wp: list[str] = [bwd_visited_ref]
-                if ei.filter_clause:
-                    wp.append(
-                        ei.filter_clause.replace("'", "''")
-                    )
+                if table_filter:
+                    wp.append(table_filter.replace("'", "''"))
                 if p.edge_predicate:
-                    wp.append(
-                        p.edge_predicate.replace("'", "''")
-                    )
+                    wp.append(p.edge_predicate.replace("'", "''"))
                 parts.append(
                     f"SELECT DISTINCT "
                     f"{bwd_next} AS _next_node "
@@ -1710,52 +2173,27 @@ class ProceduralBFSRenderer:
                     f"ON {bwd_join} "
                     f"WHERE {' AND '.join(wp)}"
                 )
-            return " UNION ALL ".join(parts)
 
-        wp = [bwd_visited_ref]
-        if p.edge_type_filter:
-            wp.append(
-                p.edge_type_filter.replace("'", "''")
-            )
-        if p.edge_predicate:
-            wp.append(
-                p.edge_predicate.replace("'", "''")
-            )
-        return (
-            f"SELECT DISTINCT {bwd_next} AS _next_node "
-            f"FROM {p.edge_table_sql} e "
-            f"INNER JOIN {frontier_ref} f "
-            f"ON {bwd_join} "
-            f"WHERE {' AND '.join(wp)}"
-        )
+        return " UNION ALL ".join(parts)
 
     def _nv_bidir_forward_edge_sql(
         self,
         p: _BFSParams,
-        extra_where: list[str] | None = None,
+        prune_against: str | None = None,
     ) -> str:
         """Build forward edge expansion SQL for nv bidir.
 
-        Handles single-table and multi-table. Quotes doubled
-        for EXECUTE IMMEDIATE.
+        UNION ALL over (direction branch × edge table); undirected traversal
+        contributes two equi-join branches. When ``prune_against`` is set, each
+        branch is restricted to next-nodes in that backward-reachable set
+        (built per branch, no CASE needed). Quotes doubled for EXECUTE
+        IMMEDIATE.
         """
-        join_cond, next_node_expr, visited_excl = (
-            self._resolve_direction(
-                p.src_col, p.dst_col,
-                p.is_backward, p.is_undirected,
-            )
+        branches = self._direction_branches(
+            p.src_col, p.dst_col, p.is_backward, p.is_undirected,
         )
-        prop_select = "".join(
-            f", e.{c}" for c in p.edge_prop_cols
-        )
-        extra = extra_where or []
+        prop_select = "".join(f", e.{c}" for c in p.edge_prop_cols)
 
-        base_visited = (
-            f"{visited_excl} NOT IN ("
-            f"SELECT node FROM bfs_visited_{p.n}_'"
-            f" || CAST(bfs_depth_{p.n} - 1"
-            f" AS STRING) || ')"
-        )
         depth_expr = (
             f"' || CAST(bfs_depth_{p.n} AS STRING) || '"
         )
@@ -1765,50 +2203,39 @@ class ProceduralBFSRenderer:
             f" AS STRING) || '"
         )
 
-        if not p.enriched.single_table:
-            parts: list[str] = []
-            for ei in p.enriched.edge_tables:
-                tbl = ei.table_descriptor.full_table_name
+        if p.enriched.single_table:
+            targets = [(p.edge_table_sql, p.edge_type_filter)]
+        else:
+            targets = [
+                (ei.table_descriptor.full_table_name, ei.filter_clause)
+                for ei in p.enriched.edge_tables
+            ]
+
+        parts: list[str] = []
+        for join_cond, next_expr in branches:
+            base_visited = self._nv_visited_not_exists(
+                f"bfs_visited_{p.n}", f"bfs_depth_{p.n}", next_expr,
+            )
+            for tbl, table_filter in targets:
                 wp: list[str] = [base_visited]
-                if ei.filter_clause:
-                    wp.append(
-                        ei.filter_clause.replace("'", "''")
-                    )
+                if table_filter:
+                    wp.append(table_filter.replace("'", "''"))
                 if p.edge_predicate:
+                    wp.append(p.edge_predicate.replace("'", "''"))
+                if prune_against:
                     wp.append(
-                        p.edge_predicate.replace("'", "''")
+                        f"{next_expr} IN "
+                        f"(SELECT node FROM {prune_against})"
                     )
-                wp.extend(extra)
                 parts.append(
                     f"SELECT "
-                    f"e.{p.src_col}, e.{p.dst_col}"
-                    f"{prop_select}, "
-                    f"{next_node_expr} AS _next_node, "
+                    f"e.{p.src_col}, e.{p.dst_col}{prop_select}, "
+                    f"{next_expr} AS _next_node, "
                     f"{depth_expr} AS _bfs_depth "
                     f"FROM {tbl} e "
                     f"INNER JOIN {frontier_ref} f "
                     f"ON {join_cond} "
                     f"WHERE {' AND '.join(wp)}"
                 )
-            return " UNION ALL ".join(parts)
 
-        wp = [base_visited]
-        if p.edge_type_filter:
-            wp.append(
-                p.edge_type_filter.replace("'", "''")
-            )
-        if p.edge_predicate:
-            wp.append(
-                p.edge_predicate.replace("'", "''")
-            )
-        wp.extend(extra)
-        return (
-            f"SELECT "
-            f"e.{p.src_col}, e.{p.dst_col}{prop_select}, "
-            f"{next_node_expr} AS _next_node, "
-            f"{depth_expr} AS _bfs_depth "
-            f"FROM {p.edge_table_sql} e "
-            f"INNER JOIN {frontier_ref} f "
-            f"ON {join_cond} "
-            f"WHERE {' AND '.join(wp)}"
-        )
+        return " UNION ALL ".join(parts)
