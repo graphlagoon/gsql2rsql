@@ -1552,3 +1552,277 @@ class TestBarrierPrecompute:
         )
         assert sql_flag == sql_default
         assert "bfs_barrier_" not in sql_flag
+
+
+# ======================================================================
+# O(barrier-on-adjacency): barrier verdict carried on the adjacency
+# ======================================================================
+
+DIRECTED_BARRIER_QUERY = """
+MATCH (a:Person)-[:KNOWS*1..3]->(b:Person)
+WHERE a.node_id = 'Alice' AND is_terminator(b.age > 30)
+RETURN b.node_id
+"""
+
+
+class TestBarrierOnAdjacency:
+    """``barrier_on_adjacency=True``: the barrier VERDICT (a boolean, not
+    the value — works for any deterministic predicate) is stamped on each
+    adjacency row at build time via ``LEFT JOIN bfs_barrier_{n}``; the
+    per-level frontier then reads the carried column (zero joins per
+    level) instead of anti-joining the barrier table every level.
+
+    The ``SELECT DISTINCT`` in the barrier build is load-bearing here: it
+    guarantees the LEFT JOIN matches at most one row per edge (no fanout).
+    """
+
+    def setup_method(self) -> None:
+        self.schema = _make_schema()
+        self.carried = ProceduralBFSOptimizations(barrier_on_adjacency=True)
+
+    def _sql(self, query: str = BARRIER_QUERY, **kw: object) -> str:
+        return _transpile(
+            query, self.schema,
+            materialization="temp_tables",
+            procedural_optimizations=self.carried,
+            **kw,  # type: ignore[arg-type]
+        )
+
+    def test_adjacency_carries_barrier_verdict(self) -> None:
+        sql = self._sql()
+        adj_ddl = sql[
+            sql.index("CREATE TEMPORARY TABLE bfs_adj_1"):sql.index("WHILE ")
+        ]
+        assert "LEFT JOIN bfs_barrier_1 b" in adj_ddl
+        assert "(b.node IS NOT NULL) AS _next_is_barrier" in adj_ddl
+        # both orientations stamp against their own next-endpoint
+        assert "ON b.node = e.dst" in adj_ddl
+        assert "ON b.node = e.src" in adj_ddl
+        # the barrier table itself is still precomputed before the loop
+        assert (
+            sql.index("CREATE TEMPORARY TABLE bfs_barrier_1 AS")
+            < sql.index("CREATE TEMPORARY TABLE bfs_adj_1")
+        )
+
+    def test_frontier_reads_carried_column_no_join(self) -> None:
+        sql = self._sql()
+        loop = _loop_body(sql)
+        assert "WHERE NOT _next_is_barrier" in loop
+        # no per-level barrier join of any kind
+        assert "NOT EXISTS (SELECT 1 FROM bfs_barrier_1" not in loop
+        assert "FROM nodes barrier" not in loop
+
+    def test_result_insert_excludes_flag_column(self) -> None:
+        """The carried boolean must not leak into bfs_result (its DDL is
+        unchanged), so the INSERT switches from SELECT * to an explicit
+        projection."""
+        sql = self._sql()
+        loop = _loop_body(sql)
+        # deferral is ON by default and the schema has edge props
+        assert (
+            "SELECT _row_id, _next_node, current_depth_1 AS _bfs_depth" in loop
+        )
+        assert "SELECT *, current_depth_1" not in loop
+        assert (
+            "CREATE TEMPORARY TABLE bfs_result_1 "
+            "(_row_id BIGINT, _next_node STRING, _bfs_depth INT);" in sql
+        )
+
+    def test_composes_without_deferral(self) -> None:
+        opts = ProceduralBFSOptimizations(
+            barrier_on_adjacency=True, deferred_edge_payload=False,
+        )
+        sql = _transpile(
+            BARRIER_QUERY, self.schema,
+            materialization="temp_tables",
+            procedural_optimizations=opts,
+        )
+        adj_ddl = sql[
+            sql.index("CREATE TEMPORARY TABLE bfs_adj_1"):sql.index("WHILE ")
+        ]
+        assert "(b.node IS NOT NULL) AS _next_is_barrier" in adj_ddl
+        loop = _loop_body(sql)
+        assert "WHERE NOT _next_is_barrier" in loop
+        # explicit projection with the full edge columns, minus the flag
+        assert (
+            "SELECT src, dst, amount, _next_node, "
+            "current_depth_1 AS _bfs_depth" in loop
+        )
+
+    def test_no_barrier_flag_is_noop(self) -> None:
+        sql_flag = self._sql(UNDIRECTED_QUERY)
+        sql_default = _transpile(
+            UNDIRECTED_QUERY, self.schema, materialization="temp_tables",
+        )
+        assert sql_flag == sql_default
+        assert "_next_is_barrier" not in sql_flag
+
+    def test_directed_falls_back_to_antijoin(self) -> None:
+        """No adjacency table for directed traversal → the verdict has
+        nowhere to ride; barrier stays on the per-level anti-join."""
+        sql_flag = self._sql(DIRECTED_BARRIER_QUERY)
+        sql_default = _transpile(
+            DIRECTED_BARRIER_QUERY, self.schema,
+            materialization="temp_tables",
+        )
+        assert sql_flag == sql_default
+        assert "_next_is_barrier" not in sql_flag
+        assert "NOT EXISTS (SELECT 1 FROM bfs_barrier_1" in sql_flag
+
+    def test_without_adjacency_falls_back_to_antijoin(self) -> None:
+        opts = ProceduralBFSOptimizations(
+            barrier_on_adjacency=True, undirected_doubled_adjacency=False,
+        )
+        sql = _transpile(
+            BARRIER_QUERY, self.schema,
+            materialization="temp_tables",
+            procedural_optimizations=opts,
+        )
+        assert "_next_is_barrier" not in sql
+        assert "NOT EXISTS (SELECT 1 FROM bfs_barrier_1" in sql
+
+    def test_numbered_views_ignores_flag(self) -> None:
+        """A lazy adjacency VIEW would re-run the LEFT JOIN on every
+        lineage reference — the flag must be a no-op on numbered_views."""
+        sql_flag = _transpile(
+            BARRIER_QUERY, self.schema,
+            materialization="numbered_views",
+            procedural_optimizations=self.carried,
+        )
+        sql_default = _transpile(
+            BARRIER_QUERY, self.schema, materialization="numbered_views",
+        )
+        assert sql_flag == sql_default
+        assert "_next_is_barrier" not in sql_flag
+
+    def test_volatile_predicate_falls_back(self) -> None:
+        sql = self._sql(VOLATILE_BARRIER_QUERY)
+        assert "_next_is_barrier" not in sql
+        assert "bfs_barrier_" not in sql
+        assert "FROM nodes barrier" in _loop_body(sql)
+
+
+# ======================================================================
+# O(prune): prune_barrier_adjacency — drop expand-FROM-barrier rows
+# ======================================================================
+
+
+class TestPruneBarrierAdjacency:
+    """``prune_barrier_adjacency=True``: adjacency rows whose join key
+    (``_jk`` — the node being expanded FROM) is a barrier are dead weight:
+    barrier nodes never enter the frontier, so those rows are scanned
+    every level and never match. Pruning them at build shrinks every
+    per-level scan. Rows where the barrier is the DESTINATION (``_next``)
+    are kept — that is how barrier nodes are discovered and returned.
+
+    Root exception (load-bearing): the root expands at depth 1 even if it
+    is itself a barrier, so rows whose ``_jk`` is a start node are kept
+    via ``OR EXISTS (... bfs_frontier_{n}_init ...)``. EXISTS/NOT EXISTS
+    (semi/anti-join) are used instead of LEFT JOIN — no fanout risk by
+    construction.
+    """
+
+    def setup_method(self) -> None:
+        self.schema = _make_schema()
+        self.prune = ProceduralBFSOptimizations(
+            prune_barrier_adjacency=True,
+        )
+
+    def _sql(self, query: str = BARRIER_QUERY, **kw: object) -> str:
+        return _transpile(
+            query, self.schema,
+            materialization="temp_tables",
+            procedural_optimizations=self.prune,
+            **kw,  # type: ignore[arg-type]
+        )
+
+    def test_adjacency_prunes_barrier_sources_with_root_exception(
+        self,
+    ) -> None:
+        sql = self._sql()
+        adj_ddl = sql[
+            sql.index("CREATE TEMPORARY TABLE bfs_adj_1"):sql.index("WHILE ")
+        ]
+        # both orientations prune on their own join-key endpoint
+        assert (
+            "NOT EXISTS (SELECT 1 FROM bfs_barrier_1 jb "
+            "WHERE jb.node = e.src)" in adj_ddl
+        )
+        assert (
+            "NOT EXISTS (SELECT 1 FROM bfs_barrier_1 jb "
+            "WHERE jb.node = e.dst)" in adj_ddl
+        )
+        # root exception: start nodes always keep their expansion rows
+        assert (
+            "OR EXISTS (SELECT 1 FROM bfs_frontier_1_init s "
+            "WHERE s.node = e." in adj_ddl
+        )
+
+    def test_frontier_init_exists_before_adjacency(self) -> None:
+        """The prune predicate references bfs_frontier_{n}_init, so it
+        must be created before the adjacency."""
+        sql = self._sql()
+        assert (
+            sql.index("CREATE TEMPORARY TABLE bfs_frontier_1_init")
+            < sql.index("CREATE TEMPORARY TABLE bfs_adj_1")
+        )
+
+    def test_destination_rows_are_kept(self) -> None:
+        """Only the join-key side is pruned — no filter on _next, so
+        edges INTO barriers are still discovered (barrier nodes still
+        appear in the output)."""
+        sql = self._sql()
+        adj_ddl = sql[
+            sql.index("CREATE TEMPORARY TABLE bfs_adj_1"):sql.index("WHILE ")
+        ]
+        assert "jb.node = e._next" not in adj_ddl
+        assert "WHERE jb.node = _next" not in adj_ddl
+
+    def test_composes_with_carried_verdict(self) -> None:
+        opts = ProceduralBFSOptimizations(
+            prune_barrier_adjacency=True,
+            barrier_on_adjacency=True,
+        )
+        sql = _transpile(
+            BARRIER_QUERY, self.schema,
+            materialization="temp_tables",
+            procedural_optimizations=opts,
+        )
+        adj_ddl = sql[
+            sql.index("CREATE TEMPORARY TABLE bfs_adj_1"):sql.index("WHILE ")
+        ]
+        assert "(b.node IS NOT NULL) AS _next_is_barrier" in adj_ddl
+        assert "NOT EXISTS (SELECT 1 FROM bfs_barrier_1 jb" in adj_ddl
+        loop = _loop_body(sql)
+        assert "WHERE NOT _next_is_barrier" in loop
+
+    def test_no_barrier_flag_is_noop(self) -> None:
+        sql_flag = self._sql(UNDIRECTED_QUERY)
+        sql_default = _transpile(
+            UNDIRECTED_QUERY, self.schema, materialization="temp_tables",
+        )
+        assert sql_flag == sql_default
+
+    def test_directed_falls_back(self) -> None:
+        sql_flag = self._sql(DIRECTED_BARRIER_QUERY)
+        sql_default = _transpile(
+            DIRECTED_BARRIER_QUERY, self.schema,
+            materialization="temp_tables",
+        )
+        assert sql_flag == sql_default
+
+    def test_numbered_views_ignores_flag(self) -> None:
+        sql_flag = _transpile(
+            BARRIER_QUERY, self.schema,
+            materialization="numbered_views",
+            procedural_optimizations=self.prune,
+        )
+        sql_default = _transpile(
+            BARRIER_QUERY, self.schema, materialization="numbered_views",
+        )
+        assert sql_flag == sql_default
+
+    def test_volatile_predicate_falls_back(self) -> None:
+        sql = self._sql(VOLATILE_BARRIER_QUERY)
+        assert "jb.node" not in sql
+        assert "FROM nodes barrier" in _loop_body(sql)
