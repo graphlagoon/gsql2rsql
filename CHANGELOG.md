@@ -2,6 +2,13 @@
 
 
 
+## v0.10.3 (2026-07-07)
+
+### Performance
+
+* perf: prune barrier adj ([`174c905`](https://github.com/graphlagoon/gsql2rsql/commit/174c905528ea3140d9958facf2978fe13b3397c6))
+
+
 ## v0.10.2 (2026-07-06)
 
 ### Documentation
