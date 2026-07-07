@@ -132,6 +132,47 @@ class ProceduralBFSOptimizations:
             frozen at build time. Ignored on numbered_views (a lazy
             precompute view gains nothing). Bidirectional BFS ignores this
             flag.
+        barrier_on_adjacency: (default OFF) O11 — temp_tables only; only
+            effective when BOTH ``undirected_doubled_adjacency`` (the
+            column rides on the adjacency) and ``barrier_precompute``
+            (``bfs_barrier_{n}`` is the join source) are active. Stamps the
+            barrier VERDICT on each adjacency row at build time —
+            ``LEFT JOIN bfs_barrier_{n} b ON b.node = e.<next>`` plus
+            ``(b.node IS NOT NULL) AS _next_is_barrier`` — so the per-level
+            frontier reads a carried boolean (``WHERE NOT
+            _next_is_barrier``, zero joins, merges into the scan stage)
+            instead of anti-joining the barrier table every level. Carrying
+            the verdict (not a value like ``to_degree``) keeps it sound for
+            ANY deterministic predicate, with no manual NULL/negation
+            reasoning: the boolean is total (never NULL) and the barrier
+            build's ``SELECT DISTINCT`` is load-bearing (the LEFT JOIN
+            matches at most one row per edge — no fanout). Trade-off vs
+            plain ``barrier_precompute``: pays one LEFT JOIN of 2|E|×|B| at
+            the adjacency build instead of ``max_hops`` per-level
+            anti-joins (each level is a separate statement — no
+            broadcast/exchange reuse); wins when |B| exceeds the broadcast
+            threshold, ~ties otherwise. Ignored on numbered_views (a lazy
+            adjacency view would re-run the LEFT JOIN on every lineage
+            reference). No-op for directed traversal and bidirectional BFS.
+        prune_barrier_adjacency: (default OFF) O12 — temp_tables only;
+            only effective when both ``undirected_doubled_adjacency`` and
+            ``barrier_precompute`` are active. Drops adjacency rows whose
+            join key (``_jk`` — the node expanded FROM) is a barrier:
+            barrier nodes never enter the frontier, so those rows are
+            scanned every level and never match — dead weight that can be
+            most of the table on hub-heavy graphs (hubs have high degree).
+            Rows where the barrier is the DESTINATION (``_next``) are
+            KEPT: edges into barriers are still discovered and returned.
+            Root exception (load-bearing): the root expands at depth 1
+            even if it is itself a barrier, so rows whose ``_jk`` is a
+            start node are kept via ``OR EXISTS (...
+            bfs_frontier_{n}_init ...)``. Emitted as EXISTS/NOT EXISTS
+            (semi/anti-join) — no fanout risk by construction.
+            Barrier-to-barrier edges (neither endpoint the root) were
+            never discoverable in legacy either (neither endpoint is ever
+            expanded), so pruning them is behavior-preserving. Ignored on
+            numbered_views; no-op for directed traversal and
+            bidirectional BFS.
     """
 
     # TODO(databricks-validation): these flags exist ONLY because the target
@@ -180,12 +221,26 @@ class ProceduralBFSOptimizations:
     #   - barrier_precompute: expected win = replaces up-to-max_hops filtered
     #     node-table scans with 1 scan + cheap anti-joins; default ON for
     #     temp_tables if confirmed.
+    #   - barrier_on_adjacency: A/B vs plain barrier_precompute with the
+    #     production |B| (barrier-id count): if |B| exceeds the broadcast
+    #     threshold the carried column should win (1 build join vs max_hops
+    #     per-level shuffles of |B|); if |B| is broadcastable expect ~tie.
+    #     Decision variable is |B| vs autoBroadcastJoinThreshold.
+    #   - prune_barrier_adjacency: A/B with the production barrier density:
+    #     the win scales with the fraction of edges INCIDENT-FROM barrier
+    #     nodes (hub-heavy graphs: potentially most of the table — every
+    #     per-level scan shrinks by that fraction); costs one anti-join +
+    #     one semi-join per orientation at the adjacency build. Verify the
+    #     root-is-barrier case on real data (kept via the frontier_init
+    #     exception).
     visited_not_exists: bool = True
     undirected_union_all: bool = False
     loop_control_into: bool = True
     undirected_doubled_adjacency: bool = True
     deferred_edge_payload: bool = True
     barrier_precompute: bool = True
+    barrier_on_adjacency: bool = False
+    prune_barrier_adjacency: bool = False
 
     def __post_init__(self) -> None:
         if self.undirected_union_all and self.undirected_doubled_adjacency:
@@ -205,6 +260,8 @@ class ProceduralBFSOptimizations:
             undirected_doubled_adjacency=False,
             deferred_edge_payload=False,
             barrier_precompute=False,
+            barrier_on_adjacency=False,
+            prune_barrier_adjacency=False,
         )
 
 
@@ -694,6 +751,38 @@ class ProceduralBFSRenderer:
             and not _sql_contains_volatile_function(p.barrier_predicate)
         )
 
+    def _barrier_on_adjacency_active(self, p: _BFSParams) -> bool:
+        """Whether the barrier verdict is carried on the adjacency (O11).
+
+        Requires BOTH the doubled adjacency (the column rides on it) and
+        the barrier precompute (``bfs_barrier_{n}`` is the join source,
+        including its volatile-predicate gate). The temp_tables check is
+        EXPLICIT — not just structural via callers — because
+        ``_adjacency_select_body`` is shared with the numbered_views
+        static-view path, where a lazy adjacency would re-run the LEFT
+        JOIN on every lineage reference (same trap as O9's row ids).
+        """
+        return (
+            self._ctx.materialization_strategy == "temp_tables"
+            and self._adjacency_active(p)
+            and self._barrier_precompute_active(p)
+            and self._ctx.procedural_optimizations.barrier_on_adjacency
+        )
+
+    def _prune_barrier_adjacency_active(self, p: _BFSParams) -> bool:
+        """Whether expand-FROM-barrier adjacency rows are pruned (O12).
+
+        Same activation conjunction as O11 (temp_tables EXPLICIT — the
+        shared ``_adjacency_select_body`` trap — plus adjacency and
+        barrier precompute with its volatile gate), under its own flag.
+        """
+        return (
+            self._ctx.materialization_strategy == "temp_tables"
+            and self._adjacency_active(p)
+            and self._barrier_precompute_active(p)
+            and self._ctx.procedural_optimizations.prune_barrier_adjacency
+        )
+
     def _adjacency_select_body(self, p: _BFSParams) -> str:
         """UNION ALL SELECT doubling each (filtered) edge into both
         orientations.
@@ -707,34 +796,66 @@ class ProceduralBFSRenderer:
 
         With ``deferred_edge_payload`` the adjacency is built narrow from
         the keyed copy (``_row_id, _jk, _next`` only; filters were already
-        applied at the keyed build).
+        applied at the keyed build). With ``barrier_on_adjacency`` each
+        orientation additionally stamps the barrier VERDICT of its next
+        endpoint — ``LEFT JOIN bfs_barrier_{n}`` + ``(b.node IS NOT NULL)
+        AS _next_is_barrier`` (total boolean, never NULL; no fanout because
+        the barrier build is DISTINCT).
         """
+        carried = self._barrier_on_adjacency_active(p)
+        barrier_col = (
+            ", (b.node IS NOT NULL) AS _next_is_barrier" if carried else ""
+        )
+
+        def barrier_join(next_col: str) -> str:
+            if not carried:
+                return ""
+            return (
+                f"\nLEFT JOIN bfs_barrier_{p.n} b ON b.node = e.{next_col}"
+            )
+
+        def prune_predicate(jk_col: str) -> str | None:
+            """O12: drop expand-FROM-barrier rows, keeping start nodes
+            (the root expands at depth 1 even if it is a barrier)."""
+            if not self._prune_barrier_adjacency_active(p):
+                return None
+            return (
+                f"(NOT EXISTS (SELECT 1 FROM bfs_barrier_{p.n} jb "
+                f"WHERE jb.node = e.{jk_col}) "
+                f"OR EXISTS (SELECT 1 FROM bfs_frontier_{p.n}_init s "
+                f"WHERE s.node = e.{jk_col}))"
+            )
+
+        orientations = [(p.src_col, p.dst_col), (p.dst_col, p.src_col)]
+
         if self._deferral_active(p):
             keyed = f"bfs_edges_keyed_{p.n}"
-            return (
-                f"SELECT e._row_id, "
-                f"e.{p.src_col} AS _jk, e.{p.dst_col} AS _next\n"
-                f"FROM {keyed} e\n"
-                f"UNION ALL\n"
-                f"SELECT e._row_id, "
-                f"e.{p.dst_col} AS _jk, e.{p.src_col} AS _next\n"
-                f"FROM {keyed} e"
-            )
+            parts = []
+            for jk, nxt in orientations:
+                where_parts = [w for w in (prune_predicate(jk),) if w]
+                parts.append(
+                    f"SELECT e._row_id, "
+                    f"e.{jk} AS _jk, e.{nxt} AS _next{barrier_col}\n"
+                    f"FROM {keyed} e"
+                    + barrier_join(nxt)
+                    + self._build_where_clause(where_parts)
+                )
+            return "\nUNION ALL\n".join(parts)
+
         prop_select = "".join(f", e.{c}" for c in p.edge_prop_cols)
-        orientations = [
-            f"e.{p.src_col} AS _jk, e.{p.dst_col} AS _next",
-            f"e.{p.dst_col} AS _jk, e.{p.src_col} AS _next",
-        ]
-        parts: list[str] = []
-        for orientation in orientations:
+        parts = []
+        for jk, nxt in orientations:
             for table_sql, table_filter in self._edge_targets(p):
                 where_parts = [
-                    w for w in (table_filter, p.edge_predicate) if w
+                    w for w in (
+                        table_filter, p.edge_predicate, prune_predicate(jk),
+                    ) if w
                 ]
                 parts.append(
                     f"SELECT e.{p.src_col}, e.{p.dst_col}{prop_select}, "
-                    f"{orientation}\n"
+                    f"e.{jk} AS _jk, e.{nxt} AS _next{barrier_col}\n"
                     f"FROM {table_sql} e"
+                    + barrier_join(nxt)
                     + self._build_where_clause(where_parts)
                 )
         return "\nUNION ALL\n".join(parts)
@@ -914,7 +1035,10 @@ class ProceduralBFSRenderer:
         # NOT EXISTS semantics ("node is a barrier iff ANY node-table row
         # with that id satisfies type filter + predicate"). Never rewrite
         # this as aggregate-then-predicate (e.g. MAX(col) > x): that is
-        # only equivalent for monotone predicates.
+        # only equivalent for monotone predicates. The DISTINCT is also
+        # load-bearing for barrier_on_adjacency (O11): it guarantees the
+        # adjacency-build LEFT JOIN matches at most one row per edge (no
+        # fanout even on out-of-contract duplicate node rows).
         if self._barrier_precompute_active(p):
             barrier_parts: list[str] = []
             if p.barrier_node_type_filter:
@@ -925,21 +1049,6 @@ class ProceduralBFSRenderer:
                 f"SELECT DISTINCT barrier.{p.barrier_node_id_col} AS node\n"
                 f"FROM {p.barrier_node_table} barrier\n"
                 f"WHERE {' AND '.join(barrier_parts)};"
-            )
-
-        # Keyed edge copy: materialized once, before the loop (O9). Must
-        # precede the adjacency, which is built from it when both are on.
-        if self._deferral_active(p):
-            lines.append(
-                f"CREATE TEMPORARY TABLE bfs_edges_keyed_{p.n} AS\n"
-                f"{self._tt_keyed_edges_select(p)};"
-            )
-
-        # Doubled adjacency: materialized once, before the loop (O8)
-        if self._adjacency_active(p):
-            lines.append(
-                f"CREATE TEMPORARY TABLE bfs_adj_{p.n} AS\n"
-                f"{self._adjacency_select_body(p)};"
             )
 
         # Visited (accumulator)
@@ -971,11 +1080,29 @@ class ProceduralBFSRenderer:
                 f"({p.src_col} STRING, {p.dst_col} STRING{prop_cols_def}, "
                 f"_next_node STRING, _bfs_depth INT);"
             )
-        # Save frontier_0 for CROSS JOIN in final view
+        # Save frontier_0 (CROSS JOIN in the final view; also the start-node
+        # set for the O12 prune's root exception — must precede the adjacency)
         lines.append(
             f"CREATE TEMPORARY TABLE bfs_frontier_{p.n}_init AS\n"
             f"SELECT node FROM bfs_frontier_{p.n};"
         )
+
+        # Keyed edge copy: materialized once, before the loop (O9). Must
+        # precede the adjacency, which is built from it when both are on.
+        if self._deferral_active(p):
+            lines.append(
+                f"CREATE TEMPORARY TABLE bfs_edges_keyed_{p.n} AS\n"
+                f"{self._tt_keyed_edges_select(p)};"
+            )
+
+        # Doubled adjacency: materialized once, before the loop (O8).
+        # Emitted last: it may reference bfs_edges_keyed (O9),
+        # bfs_barrier (O11) and bfs_frontier_init (O12).
+        if self._adjacency_active(p):
+            lines.append(
+                f"CREATE TEMPORARY TABLE bfs_adj_{p.n} AS\n"
+                f"{self._adjacency_select_body(p)};"
+            )
 
         return "\n".join(lines)
 
@@ -1001,8 +1128,12 @@ class ProceduralBFSRenderer:
                 "e._row_id" if deferred
                 else f"e.{p.src_col}, e.{p.dst_col}{prop_select}"
             )
+            barrier_col = (
+                ", e._next_is_barrier"
+                if self._barrier_on_adjacency_active(p) else ""
+            )
             return (
-                f"SELECT {select_cols}, e._next AS _next_node\n"
+                f"SELECT {select_cols}, e._next AS _next_node{barrier_col}\n"
                 f"FROM bfs_adj_{p.n} e\n"
                 f"INNER JOIN bfs_frontier_{p.n} f ON e._jk = f.node\n"
                 f"WHERE {visited}"
@@ -1085,7 +1216,11 @@ class ProceduralBFSRenderer:
         # Replace frontier: DROP + CREATE TABLE AS
         lines.append(f"    DROP TEMPORARY TABLE bfs_frontier_{p.n};")
         if p.barrier_predicate and p.barrier_node_table:
-            if self._barrier_precompute_active(p):
+            if self._barrier_on_adjacency_active(p):
+                # The verdict was stamped on the adjacency at build time
+                # (O11) — a plain column read, zero joins per level.
+                barrier_where = "NOT _next_is_barrier"
+            elif self._barrier_precompute_active(p):
                 # Anti-join the small precomputed id table (O10) instead
                 # of probing the full node table every level.
                 barrier_where = (
@@ -1107,21 +1242,36 @@ class ProceduralBFSRenderer:
                 f"FROM bfs_edges_{p.n};"
             )
 
-        # Accumulate result (only for levels >= min_hops)
+        # Accumulate result (only for levels >= min_hops). With the
+        # carried barrier verdict (O11) bfs_edges has an extra
+        # _next_is_barrier column that must NOT leak into bfs_result
+        # (its DDL is unchanged) — project explicitly instead of *.
+        if self._barrier_on_adjacency_active(p):
+            if self._deferral_active(p):
+                result_cols = "_row_id, _next_node"
+            else:
+                props = "".join(f", {c}" for c in p.edge_prop_cols)
+                result_cols = f"{p.src_col}, {p.dst_col}{props}, _next_node"
+            result_select = (
+                f"SELECT {result_cols}, "
+                f"current_depth_{p.n} AS _bfs_depth "
+            )
+        else:
+            result_select = f"SELECT *, current_depth_{p.n} AS _bfs_depth "
         if p.min_hops > 1:
             lines.append(
                 f"    IF current_depth_{p.n} >= {p.min_hops} THEN"
             )
             lines.append(
                 f"      INSERT INTO bfs_result_{p.n}\n"
-                f"      SELECT *, current_depth_{p.n} AS _bfs_depth "
+                f"      {result_select}"
                 f"FROM bfs_edges_{p.n};"
             )
             lines.append("    END IF;")
         else:
             lines.append(
                 f"    INSERT INTO bfs_result_{p.n}\n"
-                f"    SELECT *, current_depth_{p.n} AS _bfs_depth "
+                f"    {result_select}"
                 f"FROM bfs_edges_{p.n};"
             )
 

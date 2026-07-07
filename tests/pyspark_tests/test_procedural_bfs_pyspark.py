@@ -918,3 +918,205 @@ class TestNewFlagResultEquivalence:
         assert precomputed == expected, (
             f"precomputed barrier diverged: {precomputed} != {expected}"
         )
+
+    def test_barrier_on_adjacency_tt_equivalence(self, spark, graph):
+        """barrier_on_adjacency (carried verdict): identical rows vs the
+        default anti-join form, and the exact expected barrier semantics
+        (same graph/reasoning as
+        test_barrier_precompute_tt_equivalence_and_semantics)."""
+        from gsql2rsql import ProceduralBFSOptimizations
+
+        def result_set(opts):
+            rows = self._run_tt(spark, graph, self.BARRIER_QUERY, opts)
+            return {row["dst"] for row in rows}
+
+        default = result_set(ProceduralBFSOptimizations())
+        carried = result_set(ProceduralBFSOptimizations(
+            barrier_on_adjacency=True,
+        ))
+
+        expected = {"Bob", "Dave", "Eve"}
+        assert default == expected, (
+            f"default barrier semantics broken: {default} != {expected}"
+        )
+        assert carried == expected, (
+            f"carried barrier diverged: {carried} != {expected}"
+        )
+
+    def test_barrier_on_adjacency_duplicate_node_rows(self, spark, graph):
+        """Out-of-contract duplicate node rows must NOT fan out edges
+        through the adjacency LEFT JOIN — the barrier build's DISTINCT is
+        load-bearing. Bob has two rows (age 31 barrier-qualifying, age 25
+        not): 'ANY row satisfies' semantics makes Bob a barrier in both
+        mechanisms, and edge multiplicity must match the anti-join form.
+        """
+        from collections import Counter
+
+        from gsql2rsql import GraphContext, ProceduralBFSOptimizations
+
+        spark.sql("""
+            CREATE OR REPLACE TEMPORARY VIEW dup_test_nodes AS
+            SELECT * FROM VALUES
+                ('Alice', 'Person', 25),
+                ('Bob',   'Person', 31),
+                ('Bob',   'Person', 25),
+                ('Carol', 'Person', 35),
+                ('Dave',  'Person', 28)
+            AS t(node_id, node_type, age)
+        """)
+        spark.sql("""
+            CREATE OR REPLACE TEMPORARY VIEW dup_test_edges AS
+            SELECT * FROM VALUES
+                ('Alice', 'Bob',   'KNOWS', 100),
+                ('Bob',   'Carol', 'KNOWS', 200),
+                ('Alice', 'Dave',  'KNOWS', 150)
+            AS t(src, dst, relationship_type, amount)
+        """)
+        dup_graph = GraphContext(
+            spark=spark,
+            nodes_table="dup_test_nodes",
+            edges_table="dup_test_edges",
+            node_id_col="node_id",
+            node_type_col="node_type",
+            edge_type_col="relationship_type",
+            edge_src_col="src",
+            edge_dst_col="dst",
+            extra_node_attrs={"age": int},
+            extra_edge_attrs={"amount": int},
+        )
+        query = """
+        MATCH ( root {node_id: 'Alice'} )
+        MATCH p = (root)-[*1..3]-(d)
+        WHERE is_terminator(d.age > 30)
+        UNWIND relationships(p) AS r
+        RETURN r.src AS edge_src, r.dst AS edge_dst
+        """
+
+        def edge_multiset(opts):
+            sql = dup_graph.transpile(
+                query,
+                vlp_rendering_mode="procedural",
+                materialization_strategy="temp_tables",
+                procedural_optimizations=opts,
+            ).replace("TEMPORARY TABLE", "TABLE")
+            self._drop_bfs_tables(spark)
+            rows = spark.sql(sql).collect()
+            return Counter(
+                (row["edge_src"], row["edge_dst"]) for row in rows
+            )
+
+        default = edge_multiset(ProceduralBFSOptimizations())
+        carried = edge_multiset(ProceduralBFSOptimizations(
+            barrier_on_adjacency=True,
+        ))
+
+        assert default, "default SQL returned no edges"
+        assert carried == default, (
+            f"LEFT JOIN fanout or barrier divergence: "
+            f"carried {dict(carried)} != default {dict(default)}"
+        )
+        # Bob (ANY-row semantics: one row has age 31 > 30) is a barrier:
+        # the edge INTO Bob is recorded, but Bob is never expanded, so
+        # Bob->Carol must not appear.
+        assert ("Bob", "Carol") not in carried
+
+    UNDIRECTED_BARRIER_QUERY = """
+    MATCH (a:Person)-[:KNOWS*1..2]-(b:Person)
+    WHERE a.node_id = 'Alice' AND is_terminator(b.age > 29)
+    RETURN DISTINCT b.node_id AS dst
+    """
+
+    def test_prune_barrier_adjacency_tt_equivalence(self, spark, graph):
+        """prune_barrier_adjacency: identical results vs default, and the
+        barrier node IS still returned (only expansion FROM it is pruned).
+
+        Undirected *1..2 from Alice, barrier = age > 29:
+        depth 1: Alice-Bob (Bob age 30 -> barrier: RECORDED, not
+        expanded), Alice-Dave; frontier = {Dave}.
+        depth 2: Dave-Eve. Expected {Bob, Dave, Eve} — Bob present even
+        though he is a barrier; Carol absent (only reachable through Bob).
+        """
+        from gsql2rsql import ProceduralBFSOptimizations
+
+        def result_set(opts):
+            rows = self._run_tt(
+                spark, graph, self.UNDIRECTED_BARRIER_QUERY, opts,
+            )
+            return {row["dst"] for row in rows}
+
+        default = result_set(ProceduralBFSOptimizations())
+        pruned = result_set(ProceduralBFSOptimizations(
+            prune_barrier_adjacency=True,
+        ))
+
+        expected = {"Bob", "Dave", "Eve"}
+        assert default == expected, (
+            f"default semantics broken: {default} != {expected}"
+        )
+        assert pruned == expected, (
+            f"pruned diverged: {pruned} != {expected}"
+        )
+        # the barrier node is in the output in both
+        assert "Bob" in pruned
+
+    def test_prune_root_is_barrier_still_expands(self, spark, graph):
+        """THE regression test for the prune's root exception: a root
+        that itself satisfies the barrier predicate must still expand at
+        depth 1 (legacy semantics). Without the frontier_init exception
+        the pruned adjacency would return an EMPTY result here.
+
+        Root = Bob (age 30 > 29). Undirected *1..2:
+        depth 1: Bob-Alice, Bob-Carol (Carol 35 -> barrier, recorded),
+        Bob-Eve; frontier = {Alice, Eve}.
+        depth 2: Alice-Dave, Eve-Dave. Expected {Alice, Carol, Eve, Dave}.
+        """
+        from gsql2rsql import ProceduralBFSOptimizations
+
+        query = """
+        MATCH (a:Person)-[:KNOWS*1..2]-(b:Person)
+        WHERE a.node_id = 'Bob' AND is_terminator(b.age > 29)
+        RETURN DISTINCT b.node_id AS dst
+        """
+
+        def result_set(opts):
+            rows = self._run_tt(spark, graph, query, opts)
+            return {row["dst"] for row in rows}
+
+        default = result_set(ProceduralBFSOptimizations())
+        pruned = result_set(ProceduralBFSOptimizations(
+            prune_barrier_adjacency=True,
+        ))
+
+        expected = {"Alice", "Carol", "Eve", "Dave"}
+        assert default == expected, (
+            f"default semantics broken: {default} != {expected}"
+        )
+        assert pruned == expected, (
+            f"root-is-barrier expansion broken by prune: "
+            f"{pruned} != {expected}"
+        )
+
+    def test_prune_composes_with_carried_verdict_tt(self, spark, graph):
+        """O11 + O12 together: identical results vs default."""
+        from collections import Counter
+
+        from gsql2rsql import ProceduralBFSOptimizations
+
+        def edge_multiset(opts):
+            rows = self._run_tt(
+                spark, graph, self.UNDIRECTED_UNWIND_QUERY, opts,
+            )
+            return Counter(
+                (r["edge_src"], r["edge_dst"], str(r["amount"]))
+                for r in rows
+            )
+
+        default = edge_multiset(ProceduralBFSOptimizations())
+        combined = edge_multiset(ProceduralBFSOptimizations(
+            barrier_on_adjacency=True,
+            prune_barrier_adjacency=True,
+        ))
+        assert default, "default SQL returned no edges"
+        assert combined == default, (
+            f"O11+O12 diverged: {dict(combined)} != {dict(default)}"
+        )
