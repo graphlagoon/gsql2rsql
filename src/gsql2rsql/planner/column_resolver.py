@@ -913,8 +913,17 @@ class ColumnResolver:
                     # See docs_help_dev/WITH_VLP_BUG_ANALYSIS.md for details
                     sql_name = compute_sql_column_name(variable, "node_id")
                 else:
-                    # Relationship: use 'src' as the primary identifier column
-                    sql_name = compute_sql_column_name(variable, "src")  # _gsql2rsql_{var}_src
+                    # Relationship: use the schema's real source column as the
+                    # primary identifier (edges don't have an 'id' column).
+                    # Hardcoding 'src' breaks custom schemas where the source
+                    # column has a different name (e.g. source_node_id).
+                    src_prop = "src"
+                    if (
+                        entry.entity_info is not None
+                        and entry.entity_info.rel_source_join_field is not None
+                    ):
+                        src_prop = entry.entity_info.rel_source_join_field.field_name
+                    sql_name = compute_sql_column_name(variable, src_prop)
 
         else:
             # Property access (e.g., "p.name" or "r.src")

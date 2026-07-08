@@ -1233,10 +1233,17 @@ class ExpressionRenderer:
                 pn = pf.field_name
                 props.append((pn, f"{prefix}{pn}"))
         else:
+            # Derive key/column from the schema's real source/sink column names
+            # (mirrors the NODE branch). Hardcoding "src"/"dst" only works when
+            # the schema happens to use those names; with custom columns
+            # (e.g. source_node_id) it produced references to columns never
+            # materialized in the inner projection (UNRESOLVED_COLUMN).
             if entity_field.rel_source_join_field:
-                props.append(("src", f"{prefix}src"))
+                pn = entity_field.rel_source_join_field.field_name
+                props.append((pn, f"{prefix}{pn}"))
             if entity_field.rel_sink_join_field:
-                props.append(("dst", f"{prefix}dst"))
+                pn = entity_field.rel_sink_join_field.field_name
+                props.append((pn, f"{prefix}{pn}"))
             for pf in entity_field.encapsulated_fields:
                 pn = pf.field_name
                 props.append((pn, f"{prefix}{pn}"))
