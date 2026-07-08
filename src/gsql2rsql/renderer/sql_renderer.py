@@ -701,11 +701,13 @@ class SQLRenderer:
             for prop_field in entity_field.encapsulated_fields:
                 add_column(prop_field.field_name)
         else:
-            # Edge/Relationship: add src, dst, and all encapsulated properties
+            # Edge/Relationship: add the schema's real source/sink columns
+            # and all encapsulated properties. Hardcoding "src"/"dst" breaks
+            # custom schemas (e.g. source_node_id) with dangling columns.
             if entity_field.rel_source_join_field:
-                self._required_columns.add(f"{prefix}src")
+                add_column(entity_field.rel_source_join_field.field_name)
             if entity_field.rel_sink_join_field:
-                self._required_columns.add(f"{prefix}dst")
+                add_column(entity_field.rel_sink_join_field.field_name)
             for prop_field in entity_field.encapsulated_fields:
                 add_column(prop_field.field_name)
 
@@ -783,11 +785,13 @@ class SQLRenderer:
             for prop_field in entity_field.encapsulated_fields:
                 add_column(prop_field.field_name)
         else:
-            # Edge/Relationship: add src, dst, and all encapsulated properties
+            # Edge/Relationship: add the schema's real source/sink columns
+            # and all encapsulated properties. Hardcoding "src"/"dst" breaks
+            # custom schemas (e.g. source_node_id) with dangling columns.
             if entity_field.rel_source_join_field:
-                self._required_columns.add(f"{prefix}src")
+                add_column(entity_field.rel_source_join_field.field_name)
             if entity_field.rel_sink_join_field:
-                self._required_columns.add(f"{prefix}dst")
+                add_column(entity_field.rel_sink_join_field.field_name)
             for prop_field in entity_field.encapsulated_fields:
                 add_column(prop_field.field_name)
 

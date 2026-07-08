@@ -130,7 +130,7 @@ def generate_category_page(
         "    these examples require further curation and validation,",
         "    including the transpilation results. if you spot any issues,",
         "    please open an issue or contribute at",
-        "    [gsql2rsql/issues](https://github.com/devmessias/gsql2rsql/issues)",
+        "    [gsql2rsql/issues](https://github.com/graphlagoon/gsql2rsql/issues)",
         "",
         "Each example shows the original OpenCypher query and its corresponding",
         "Databricks SQL translation.",

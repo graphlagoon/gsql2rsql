@@ -453,3 +453,127 @@ class TestEntityStructEdgeCases:
             "RETURN a ORDER BY should generate NAMED_STRUCT(...) AS a"
         )
         assert "ORDER BY" in sql.upper(), "Should have ORDER BY clause"
+
+
+# =============================================================================
+# TEST CLASS: Edge struct with custom src/dst column names (regression)
+# =============================================================================
+
+
+@pytest.fixture
+def graph_context_custom_cols():
+    """GraphContext with NON-default edge src/dst column names.
+
+    Regression fixture: the edge NAMED_STRUCT used to hardcode 'src'/'dst'
+    keys/columns, producing dangling references (_gsql2rsql_r_src) when the
+    schema uses custom column names like 'source_node_id'.
+    """
+    g = GraphContext(
+        nodes_table="cat.sch.nodes",
+        edges_table="cat.sch.edges",
+        node_id_col="node_id",
+        node_type_col="node_type",
+        edge_type_col="edge_type",
+        edge_src_col="source_node_id",
+        edge_dst_col="target_node_id",
+        extra_edge_attrs={"edge_id": str},
+    )
+    g.set_types(node_types=["Person"], edge_types=["OWNS"])
+    return g
+
+
+def dangling_struct_refs(sql: str, entity_var: str) -> set[str]:
+    """Return prefixed columns referenced in the SQL but never materialized.
+
+    Every `_gsql2rsql_<var>_*` column referenced anywhere must also appear
+    as an `AS _gsql2rsql_<var>_*` alias somewhere in the SQL; otherwise it is
+    a dangling reference (UNRESOLVED_COLUMN at runtime).
+    """
+    import re
+    prefix = rf"_gsql2rsql_{re.escape(entity_var)}_\w+"
+    referenced = set(re.findall(prefix, sql))
+    materialized = set(re.findall(rf"AS\s+({prefix})", sql))
+    return referenced - materialized
+
+
+class TestReturnEdgeCustomColumns:
+    """RETURN r must derive struct keys from the schema's real src/dst columns."""
+
+    def test_return_edge_custom_src_dst_no_dangling_refs(
+        self, graph_context_custom_cols
+    ):
+        """Struct must reference only materialized columns with custom schema.
+
+        Query: MATCH (s)-[r]->(d) RETURN r
+        Bug: NAMED_STRUCT referenced _gsql2rsql_r_src/_gsql2rsql_r_dst which
+        were never materialized (schema columns are source_node_id/target_node_id).
+        """
+        sql = graph_context_custom_cols.transpile("""
+            MATCH (s)-[r]->(d)
+            RETURN r
+        """)
+
+        print(f"\n=== SQL ===\n{sql}")
+
+        assert has_named_struct(sql, "r"), "RETURN r should generate NAMED_STRUCT"
+
+        dangling = dangling_struct_refs(sql, "r")
+        assert not dangling, (
+            f"Struct references columns never materialized: {dangling}"
+        )
+
+        # Keys must be the REAL schema column names, not hardcoded src/dst
+        assert struct_contains_field(sql, "source_node_id"), (
+            "STRUCT should use real source column name 'source_node_id'"
+        )
+        assert struct_contains_field(sql, "target_node_id"), (
+            "STRUCT should use real sink column name 'target_node_id'"
+        )
+        assert not struct_contains_field(sql, "src"), (
+            "STRUCT must not contain hardcoded 'src' key with custom schema"
+        )
+        assert not struct_contains_field(sql, "dst"), (
+            "STRUCT must not contain hardcoded 'dst' key with custom schema"
+        )
+
+    def test_return_edge_custom_src_dst_collect(self, graph_context_custom_cols):
+        """collect(r) shares the same struct collector — must also be fixed.
+
+        Query: MATCH (s)-[r]->(d) RETURN collect(r) AS rels
+        """
+        sql = graph_context_custom_cols.transpile("""
+            MATCH (s)-[r]->(d)
+            RETURN collect(r) AS rels
+        """)
+
+        print(f"\n=== SQL ===\n{sql}")
+
+        assert "COLLECT_LIST" in sql, "Should use COLLECT_LIST"
+        assert "NAMED_STRUCT" in sql, "Should have NAMED_STRUCT inside COLLECT_LIST"
+
+        dangling = dangling_struct_refs(sql, "r")
+        assert not dangling, (
+            f"Struct references columns never materialized: {dangling}"
+        )
+        assert struct_contains_field(sql, "source_node_id")
+        assert struct_contains_field(sql, "target_node_id")
+
+    def test_return_edge_default_schema_unchanged(self, graph_context_minimal):
+        """Default schema (src/dst) must keep 'src'/'dst' struct keys.
+
+        Locks in no-regression: consumers reading r.src / r.dst on the default
+        schema must not break.
+        """
+        sql = graph_context_minimal.transpile("""
+            MATCH (s)-[r:KNOWS]->(d)
+            RETURN r
+        """)
+
+        print(f"\n=== SQL ===\n{sql}")
+
+        assert struct_contains_field(sql, "src"), "Default STRUCT keeps 'src' key"
+        assert struct_contains_field(sql, "dst"), "Default STRUCT keeps 'dst' key"
+        dangling = dangling_struct_refs(sql, "r")
+        assert not dangling, (
+            f"Struct references columns never materialized: {dangling}"
+        )

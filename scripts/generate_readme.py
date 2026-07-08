@@ -160,8 +160,8 @@ def add_readme_header(content: str) -> str:
     """Add README-specific header with badges."""
     badges = """
 [![PyPI version](https://badge.fury.io/py/gsql2rsql.svg)](https://badge.fury.io/py/gsql2rsql)
-[![CI](https://github.com/devmessias/gsql2rsql/actions/workflows/ci.yml/badge.svg)](https://github.com/devmessias/gsql2rsql/actions/workflows/ci.yml)
-[![Documentation](https://img.shields.io/badge/docs-mkdocs-blue)](https://devmessias.github.io/gsql2rsql)
+[![CI](https://github.com/graphlagoon/gsql2rsql/actions/workflows/ci.yml/badge.svg)](https://github.com/graphlagoon/gsql2rsql/actions/workflows/ci.yml)
+[![Documentation](https://img.shields.io/badge/docs-mkdocs-blue)](https://graphlagoon.github.io/gsql2rsql)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 """
