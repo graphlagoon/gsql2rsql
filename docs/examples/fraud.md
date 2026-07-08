@@ -8,7 +8,7 @@ This page contains transpiled examples for **fraud queries** queries.
     these examples require further curation and validation,
     including the transpilation results. if you spot any issues,
     please open an issue or contribute at
-    [gsql2rsql/issues](https://github.com/devmessias/gsql2rsql/issues)
+    [gsql2rsql/issues](https://github.com/graphlagoon/gsql2rsql/issues)
 
 Each example shows the original OpenCypher query and its corresponding
 Databricks SQL translation.
@@ -21,8 +21,17 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Finds pairs of accounts that share transactions at the same merchant.
-    High shared transaction counts may indicate coordinated fraud or account sharing.
+    **Use case:** Co-shopper fraud rings involve multiple accounts making
+    purchases at the same merchants to exploit promotional offers, loyalty
+    programs, or split fraudulent transactions. Financial institutions flag
+    account pairs with abnormally high shared merchant overlap as potential
+    collusion, particularly when combined with new account or velocity signals.
+    
+    **Interpreting results:** `shared_transactions` counts how many times
+    both accounts transacted at the same merchant. Legitimate pairs (e.g.,
+    spouses) typically share 1-3 merchants. Counts above 5 at the same
+    merchant warrant investigation. The LIMIT 10 surfaces the most connected
+    pairs first.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -193,8 +202,18 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Detects indirect transfer chains between high-risk accounts.
-    Fraudsters often use intermediary accounts to obscure direct connections.
+    **Use case:** Layering is a core money laundering technique where funds
+    pass through intermediary ("camouflage") accounts to obscure the link
+    between origin and destination. AML compliance teams use variable-length
+    path queries (2-4 hops) to uncover these hidden chains that traditional
+    rule-based systems miss, since direct account-to-account monitoring only
+    catches single-hop transfers.
+    
+    **Interpreting results:** `chain_length` indicates how many intermediaries
+    were used; longer chains suggest more sophisticated laundering. Both
+    endpoints have `risk_score > 70`, so the intermediary accounts are the
+    key finding -- they may be unwitting mules or synthetic identities.
+    `path_nodes` reveals the full chain for investigators.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -319,9 +338,18 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Monitors POS machines already flagged as high-risk for ongoing suspicious activity.
-    Filters by vertex metadata (risk_status, flagged) to focus on known problem devices.
-    Total volume and transaction counts help prioritize investigation.
+    **Use case:** Compromised POS terminals are a primary vector for card
+    skimming and point-of-compromise (POC) fraud. Acquirer banks and payment
+    processors monitor flagged terminals for ongoing activity to assess
+    the scope of a breach and determine whether to disable the device.
+    High `stddev_amount` indicates erratic transaction patterns typical
+    of test-and-exploit behavior.
+    
+    **Interpreting results:** `total_volume` quantifies financial exposure
+    from the compromised device. `stddev_amount` relative to `avg_amount`
+    is key: a high ratio (stddev > 2x avg) suggests mixed legitimate and
+    fraudulent activity. Devices with >50 transactions and high volume
+    should be prioritized for immediate deactivation and forensic review.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -471,9 +499,18 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Finds addresses associated with multiple recently created accounts.
-    May indicate synthetic identities or identity fabrication rings.
-    Uses WITH...WHERE pattern for HAVING-like filtering on aggregated columns.
+    **Use case:** Synthetic identity fraud (SIF) is the fastest-growing
+    financial crime in the US (~$6B annual losses). Fraudsters fabricate
+    identities by combining real and fake data, then register multiple
+    accounts at the same address. Graph analysis of shared addresses is
+    one of the most effective detection methods, as it reveals clusters
+    invisible to traditional identity verification systems.
+    
+    **Interpreting results:** `person_count > 5` at a single address is
+    the alert threshold; legitimate multi-person addresses (apartments)
+    typically have 2-4 residents. The `creation_date > 2023-01-01` filter
+    focuses on recently created identities. High counts in specific cities
+    may indicate regional fraud rings operating from a single location.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -667,8 +704,18 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Detects cards with many small-value transactions in a short time.
-    Common pattern for fraudsters testing stolen card validity.
+    **Use case:** Card testing (BIN attacks) is a precursor to large-scale
+    card fraud. After acquiring stolen card numbers (from breaches or dark
+    web), fraudsters make sub-$1 transactions to verify which cards are
+    still active before making large purchases. Issuers use real-time
+    velocity rules, but graph analysis catches patterns across multiple
+    merchants that single-merchant rules miss.
+    
+    **Interpreting results:** `small_tx_count > 10` in 24 hours is a strong
+    signal. `merchant_count` relative to `small_tx_count` matters: testing
+    across many merchants (high ratio) is more suspicious than repeated
+    small purchases at one merchant (which could be legitimate subscriptions).
+    Cards flagged here should be blocked immediately.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -803,9 +850,17 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Identifies accounts making synchronized transactions at the same merchant.
-    May indicate coordinated fraud or collusion rings.
-    Uses WITH...WHERE pattern for HAVING-like filtering on aggregated columns.
+    **Use case:** Collusion detection identifies coordinated fraud where
+    multiple accounts act in concert. Synchronized transactions (within
+    5 minutes at the same merchant) are a hallmark of organized retail
+    crime, promotion abuse, or coordinated account takeover. The temporal
+    correlation is what distinguishes collusion from coincidental co-shopping.
+    
+    **Interpreting results:** `coordinated_count > 5` means the pair made
+    synchronized purchases at the same merchant more than 5 times. The
+    `a1.id < a2.id` filter deduplicates pairs. High counts strongly suggest
+    coordination -- even 3-4 synchronized events at the same merchant is
+    statistically improbable for unrelated accounts.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -1034,8 +1089,18 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Finds multi-hop transfer chains moving large amounts quickly.
-    Classic pattern for money laundering via mule accounts.
+    **Use case:** Money mule networks are the operational backbone of
+    money laundering. Recruited individuals (mules) receive and forward
+    illicit funds through their accounts. The graph pattern detects
+    chains of 3-6 hops where each transfer exceeds $1,000 within a
+    7-day window -- the speed and amount thresholds distinguish laundering
+    from normal business flows. Required by BSA/AML regulations.
+    
+    **Interpreting results:** `hops` indicates network depth; 3-4 hops is
+    typical for organized mule networks, while 5-6 hops suggests
+    professional laundering operations. `total_amount` aggregates all
+    transfers in the chain. The source and sink accounts are the primary
+    investigation targets, while intermediate accounts may be unwitting mules.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -1193,9 +1258,18 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Measures similarity between customers based on shared cards and merchants.
-    High similarity scores may indicate card sharing, family fraud, or organized rings.
-    Combines multiple metrics for more accurate clustering.
+    **Use case:** Entity resolution and fraud ring detection rely on
+    similarity scoring between customers. Shared cards indicate direct
+    account access overlap, while shared merchants indicate behavioral
+    overlap. Together, they form a composite similarity metric used by
+    fraud analytics teams to cluster accounts that may belong to the
+    same actor or organized group.
+    
+    **Interpreting results:** `similarity_score > 0.3` means significant
+    overlap. Scores above 0.6 strongly suggest the same person or
+    coordinated actors. `shared_cards > 0` is the primary signal (direct
+    access overlap); `shared_merchants` adds behavioral context. The
+    LIMIT 50 focuses on the most similar pairs for manual investigation.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -1351,15 +1425,15 @@ Databricks SQL translation.
              _left_6.`c1` AS `c1`
             ,_left_6.`c2` AS `c2`
             ,_left_6.`shared_cards` AS `shared_cards`
-            ,_right_6._gsql2rsql__anon2_card_id AS _gsql2rsql__anon2_card_id
-            ,_right_6._gsql2rsql_m_id AS _gsql2rsql_m_id
-            ,_right_6._gsql2rsql_c1_id AS _gsql2rsql_c1_id
             ,_right_6._gsql2rsql__anon2_merchant_id AS _gsql2rsql__anon2_merchant_id
-            ,_right_6._gsql2rsql_c1_status AS _gsql2rsql_c1_status
+            ,_right_6._gsql2rsql_m_id AS _gsql2rsql_m_id
             ,_right_6._gsql2rsql__anon1_card_id AS _gsql2rsql__anon1_card_id
+            ,_right_6._gsql2rsql_c1_status AS _gsql2rsql_c1_status
             ,_right_6._gsql2rsql__anon1_customer_id AS _gsql2rsql__anon1_customer_id
-            ,_right_6._gsql2rsql_c1_name AS _gsql2rsql_c1_name
             ,_right_6._gsql2rsql_card1_id AS _gsql2rsql_card1_id
+            ,_right_6._gsql2rsql_c1_name AS _gsql2rsql_c1_name
+            ,_right_6._gsql2rsql_c1_id AS _gsql2rsql_c1_id
+            ,_right_6._gsql2rsql__anon2_card_id AS _gsql2rsql__anon2_card_id
           FROM (
             SELECT
                `c1`
@@ -1728,8 +1802,19 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Detects accounts with abnormally high transaction frequency.
-    May indicate automated fraud, account compromise, or velocity attacks.
+    **Use case:** Velocity checks are a first line of defense in real-time
+    fraud prevention. Automated fraud tools (bots, scripts) generate
+    transactions far faster than human behavior. >20 transactions/hour
+    is a strong indicator of automated activity, account takeover, or
+    card-not-present fraud using stolen credentials. Payment processors
+    use these signals for real-time transaction blocking.
+    
+    **Interpreting results:** `tx_per_hour > 20` is the alert threshold;
+    normal accounts rarely exceed 5-10 transactions/hour even during
+    heavy shopping. `total_amount` helps distinguish between high-frequency
+    small transactions (testing pattern) and high-frequency large
+    transactions (rapid cash-out pattern). Both are fraud, but require
+    different response playbooks.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -1885,8 +1970,19 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Finds customers with suspiciously high return rates.
-    May indicate wardrobing, receipt fraud, or return fraud schemes.
+    **Use case:** Return fraud costs retailers ~$24B annually (NRF estimates).
+    Common schemes include wardrobing (wear-and-return), receipt fraud,
+    and returning stolen merchandise. A return rate >50% over 10+ purchases
+    is statistically anomalous and flags professional return abusers.
+    Retailers use these signals to restrict return privileges or flag
+    accounts for loss prevention review.
+    
+    **Interpreting results:** `return_rate` of 0.5 means half of all
+    purchases are returned. Rates above 0.7 are almost certainly fraudulent.
+    The `total_purchases > 10` threshold filters out new customers with
+    insufficient history. Cross-reference with purchase categories --
+    electronics and designer goods have naturally higher return rates
+    but also higher fraud exposure.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -2102,8 +2198,18 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Identifies accounts with sudden spending increases before defaulting.
-    Classic bust-out fraud pattern where fraudsters max out credit before disappearing.
+    **Use case:** Bust-out fraud is a deliberate scheme where a fraudster
+    builds a good credit history, then rapidly maxes out all credit lines
+    and vanishes. The pattern is a sudden 5x+ spending spike in the last
+    week before default. This query runs retrospectively on defaulted
+    accounts to identify bust-out vs. genuine financial hardship, informing
+    collection strategy and future underwriting models.
+    
+    **Interpreting results:** `spike_ratio > 5` means the last week's
+    spending was 5x the preceding weeks. Ratios above 10 are almost
+    certainly bust-out. `last_week` shows the absolute amount extracted.
+    Accounts with high spike ratios should be flagged as intentional fraud
+    (no collection value) rather than distressed borrowers (recovery possible).
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -2263,8 +2369,19 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Detects circular money flows where funds return to origin account.
-    Strong indicator of structuring or layering in money laundering.
+    **Use case:** Circular payment detection is a cornerstone of AML
+    (Anti-Money Laundering) investigation. In the layering phase,
+    launderers route funds through a series of accounts and return them
+    to the origin to create an appearance of legitimate business activity.
+    The cycle path pattern `(a)-[:TRANSFER*4..8]->(a)` is uniquely suited
+    to graph databases and extremely difficult to detect with SQL alone.
+    
+    **Interpreting results:** `cycle_length` of 4-5 hops is typical for
+    semi-automated laundering; 6-8 hops suggests professional operations.
+    `cycle_amount` aggregates all transfers in the cycle. The `amount > 500`
+    per hop filter excludes small circular flows that may be legitimate
+    (e.g., internal treasury movements). `cycle_accounts` reveals the full
+    ring for investigators to trace.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -2322,24 +2439,12 @@ Databricks SQL translation.
         ,_gsql2rsql_path_edges AS _gsql2rsql_path_edges
       FROM (
         SELECT
-           sink.id AS _gsql2rsql_a_id
-          ,sink.holder_name AS _gsql2rsql_a_holder_name
-          ,sink.risk_score AS _gsql2rsql_a_risk_score
-          ,sink.status AS _gsql2rsql_a_status
-          ,sink.default_date AS _gsql2rsql_a_default_date
-          ,sink.home_country AS _gsql2rsql_a_home_country
-          ,sink.kyc_status AS _gsql2rsql_a_kyc_status
-          ,sink.days_since_creation AS _gsql2rsql_a_days_since_creation
-          ,p.start_node
+           p.start_node
           ,p.end_node
           ,p.depth
           ,p.path AS _gsql2rsql_path_id
           ,p.path_edges AS _gsql2rsql_path_edges
         FROM paths_1 p
-        JOIN catalog.fraud.Account sink
-          ON sink.id = p.end_node
-        JOIN catalog.fraud.Account source
-          ON source.id = p.start_node
         WHERE p.depth >= 4 AND p.depth <= 8 AND p.start_node = p.end_node
       ) AS _proj
       WHERE ((SIZE(_gsql2rsql_path_id) - 1)) >= (4)
@@ -2400,8 +2505,18 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Finds accounts with high-value cross-border transaction activity.
-    May indicate trade-based money laundering or sanctions evasion.
+    **Use case:** Cross-border transaction monitoring is mandated by FATF
+    (Financial Action Task Force) recommendations and enforced by FinCEN
+    in the US. High-value transactions to countries different from the
+    account holder's home country trigger enhanced due diligence (EDD)
+    requirements. Patterns of repeated high-value cross-border flows
+    may indicate trade-based money laundering (TBML) or sanctions evasion.
+    
+    **Interpreting results:** `cross_border_count > 5` with amounts >$10K
+    each indicates a pattern, not a one-off trip expense. `total_amount`
+    quantifies total exposure. The destination country is critical context:
+    flows to FATF grey-list or blacklist countries require immediate SAR
+    (Suspicious Activity Report) filing.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -2638,8 +2753,18 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Identifies accounts with dramatic changes in transaction patterns.
-    Sudden increases may indicate account takeover by fraudsters.
+    **Use case:** Account takeover (ATO) is one of the most damaging fraud
+    types, where criminals gain control of legitimate accounts. The
+    behavioral shift detection compares 7-day recent average vs. 30-day
+    historical baseline. A 3x+ increase in average transaction amount
+    indicates the account is being used differently -- likely by a
+    different actor. ATO losses exceeded $11B in 2023 (Javelin Strategy).
+    
+    **Interpreting results:** `behavior_change_ratio > 3` means recent
+    spending is 3x the historical pattern. Ratios above 5 are high-confidence
+    ATO signals. The `avg_30d_ago IS NOT NULL` filter ensures the account
+    has sufficient history. Combine with IP/device change data (not in
+    this graph) for stronger ATO confirmation.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -2794,8 +2919,19 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Detects multiple deposits just under regulatory reporting thresholds.
-    Classic smurfing/structuring pattern to avoid currency transaction reports.
+    **Use case:** Structuring (smurfing) is a federal crime under 31 USC 5324.
+    It involves deliberately splitting deposits to stay below the $10,000
+    Currency Transaction Report (CTR) threshold. Banks are required to
+    detect and report structuring via SARs. The $9,000-$10,000 range with
+    >5 deposits in 30 days is a textbook pattern that compliance teams
+    must monitor.
+    
+    **Interpreting results:** `deposit_count > 5` just under $10K in 30 days
+    is a strong structuring indicator. `avg_deposit` close to $9,500
+    (consistently just under the threshold) is more suspicious than varied
+    amounts in the $9K-$10K range. `total_deposits` quantifies the
+    cumulative amount structured, which may itself exceed reporting
+    thresholds and require a CTR.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -2954,10 +3090,19 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Filters accounts by metadata (KYC status, account age) to focus on risky profiles.
-    Aggregates transaction volumes by merchant category to identify unusual spending patterns.
-    New accounts with high volumes in specific categories (e.g., electronics, gift cards) are red flags.
-    Combines vertex filtering with edge aggregation for comprehensive risk assessment.
+    **Use case:** KYC (Know Your Customer) gaps combined with rapid spending
+    are a top fraud indicator. New accounts (<30 days) or accounts with
+    incomplete KYC that immediately generate high transaction volumes in
+    specific merchant categories (electronics, gift cards, cryptocurrency)
+    are likely synthetic identities or stolen credentials being cashed out.
+    Compliance teams use this for enhanced transaction monitoring (ETM).
+    
+    **Interpreting results:** Group results by `merchant_category` to spot
+    concentration. High volumes in "electronics" or "gift_cards" are higher
+    risk than "groceries." `days_since_creation < 30` combined with
+    `kyc_status = 'incomplete'` is the highest risk combination.
+    `avg_transaction` much higher than the category average indicates
+    the account is not behaving like a typical customer in that segment.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -3204,10 +3349,20 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Identifies cards shared between blacklisted and verified customers (contamination).
-    Uses customer status metadata to filter and categorize relationships.
-    Calculates total transaction metrics to assess card usage impact.
-    Critical for identifying compromised cards or insider fraud networks.
+    **Use case:** Card contamination tracking detects when a card is shared
+    between a known bad actor (blacklisted) and a supposedly clean customer
+    (verified). This is a strong signal of either organized fraud (the
+    verified customer is part of the ring) or card theft (the verified
+    customer is a victim). Card networks (Visa, Mastercard) require issuers
+    to monitor for this cross-contamination pattern as part of fraud
+    liability management.
+    
+    **Interpreting results:** `blacklisted_count` shows how many bad actors
+    share the card. Even 1 is a critical finding. `verified_count` shows
+    potentially compromised legitimate customers who need notification.
+    `total_amount` quantifies exposure on the contaminated card.
+    All flagged cards should be reissued immediately, and verified customers
+    should receive fraud alerts.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -3346,11 +3501,11 @@ Databricks SQL translation.
           ,_left_5.`blacklisted_customers` AS `blacklisted_customers`
           ,_left_5.`verified_customers` AS `verified_customers`
           ,_right_5._gsql2rsql__anon1_transaction_id AS _gsql2rsql__anon1_transaction_id
-          ,_right_5._gsql2rsql_t_id AS _gsql2rsql_t_id
-          ,_right_5._gsql2rsql__anon1_card_id AS _gsql2rsql__anon1_card_id
-          ,_right_5._gsql2rsql_card_id AS _gsql2rsql_card_id
           ,_right_5._gsql2rsql_card_number AS _gsql2rsql_card_number
           ,_right_5._gsql2rsql_t_amount AS _gsql2rsql_t_amount
+          ,_right_5._gsql2rsql_t_id AS _gsql2rsql_t_id
+          ,_right_5._gsql2rsql_card_id AS _gsql2rsql_card_id
+          ,_right_5._gsql2rsql__anon1_card_id AS _gsql2rsql__anon1_card_id
         FROM (
           SELECT
              `card`
