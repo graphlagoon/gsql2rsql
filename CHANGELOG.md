@@ -2,6 +2,22 @@
 
 
 
+## v0.10.4 (2026-07-08)
+
+### Documentation
+
+* docs: link new repo org ([`773c55d`](https://github.com/graphlagoon/gsql2rsql/commit/773c55d4eb284829080c401af03996b2d9275f10))
+
+### Fix
+
+* fix(renderer): derive edge src/dst struct columns from schema instead of hardcoding
+
+RETURN r / collect(r) hardcoded NAMED_STRUCT keys and required-columns to
+&#34;src&#34;/&#34;dst&#34;, which only worked by coincidence on the default schema. Custom
+edge schemas (e.g. edge_src_col=&#34;source_node_id&#34;) produced dangling column
+references, failing at runtime with UNRESOLVED_COLUMN. ([`bef9f39`](https://github.com/graphlagoon/gsql2rsql/commit/bef9f39401b1f8bfc56bff88b2e551801ebc2dd4))
+
+
 ## v0.10.3 (2026-07-07)
 
 ### Performance
