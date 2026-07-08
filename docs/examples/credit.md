@@ -8,7 +8,7 @@ This page contains transpiled examples for **credit queries** queries.
     these examples require further curation and validation,
     including the transpilation results. if you spot any issues,
     please open an issue or contribute at
-    [gsql2rsql/issues](https://github.com/devmessias/gsql2rsql/issues)
+    [gsql2rsql/issues](https://github.com/graphlagoon/gsql2rsql/issues)
 
 Each example shows the original OpenCypher query and its corresponding
 Databricks SQL translation.
@@ -21,8 +21,16 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Analyzes recent transaction patterns to assess credit risk.
-    High overdraft rates indicate elevated default risk.
+    **Use case:** Banks use overdraft frequency as a key behavioral signal in
+    internal credit scoring models (e.g., FICO Behavioral Score). A high
+    overdraft rate over 90 days often triggers watchlist placement or
+    preemptive credit line reduction.
+    
+    **Interpreting results:** `overdraft_rate` close to 0 means healthy account
+    usage. Rates above 0.05 (5%) warrant review; above 0.15 typically triggers
+    risk mitigation actions. Combine with `avg_transaction` to distinguish
+    between high-volume customers with occasional overdrafts vs. chronically
+    underfunded accounts.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -240,8 +248,15 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Finds customers with excellent payment history for credit line increases.
-    High on-time rates indicate low default probability.
+    **Use case:** Credit line increase programs target customers with proven
+    repayment discipline. Lenders use on-time payment ratios (>95% over 6+
+    payments) as a primary criterion for automatic limit upgrades, reducing
+    manual underwriting costs.
+    
+    **Interpreting results:** `on_time_rate` of 1.0 means perfect payment
+    history. The query pre-filters to >0.95, so all results are strong
+    candidates. Sort by `l.amount` to prioritize customers with larger
+    existing loans, as they represent the most significant upsell opportunity.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -496,8 +511,16 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Identifies customers with multiple active loans suitable for consolidation.
-    Can improve customer retention and reduce default risk.
+    **Use case:** Debt consolidation is a common retention strategy in
+    consumer lending. Customers juggling 3+ loans at varying rates are at
+    higher default risk due to payment complexity. Offering a single
+    consolidated loan at a competitive rate reduces churn and simplifies
+    collections.
+    
+    **Interpreting results:** `active_loans >= 3` with `total_debt > 10000`
+    flags high-burden customers. Compare `avg_rate` against your current
+    consolidation product rate; if `avg_rate` is significantly higher,
+    the customer has a strong financial incentive to consolidate.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -637,8 +660,16 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Combines multiple risk indicators to predict default probability.
-    NSF fees and late payments are strong default predictors.
+    **Use case:** Early default detection models combine NSF (Non-Sufficient
+    Funds) events, late fees, and negative balances as leading indicators.
+    These behavioral signals often precede default by 30-90 days, giving
+    collections teams time for proactive outreach (payment plans, forbearance).
+    
+    **Interpreting results:** `default_risk_score` weights late fees at 2x
+    because they indicate systemic payment failure, not just momentary
+    insufficient funds. A score above 5 is a strong default signal.
+    `min_balance < 0` alone (negative balance) is a severe indicator even
+    with low NSF/late counts.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -854,8 +885,16 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Examines internal transfer patterns to understand liquidity management.
-    Frequent internal transfers may indicate cash flow stress.
+    **Use case:** Internal transfer chains (account-to-account within the same
+    customer) are a known liquidity stress signal. Treasury and risk teams
+    monitor these patterns to detect "kiting" behavior or cash flow
+    juggling that precedes overdrafts or missed payments.
+    
+    **Interpreting results:** `transfer_chains` counts distinct multi-hop
+    transfer paths. High counts (top 20) with `avg_chain_length > 2`
+    suggest the customer is actively moving money across accounts to cover
+    shortfalls. A single direct transfer (chain length 1) is normal;
+    chains of 3 hops indicate complex liquidity management.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -990,8 +1029,16 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Identifies high-value customers suitable for premium offerings.
-    High transaction volume and balances indicate creditworthiness.
+    **Use case:** Customer segmentation for premium products (e.g., platinum
+    cards, private banking) requires identifying high-value relationships.
+    Customers with >100K transaction volume and >10K average balance over
+    6 months represent the top tier for targeted premium offers.
+    
+    **Interpreting results:** `total_volume` reflects transactional engagement,
+    while `avg_balance` reflects deposit stability. The ideal premium
+    candidate has both high volume AND high balance. `account_count > 1`
+    indicates a multi-product relationship, making the customer stickier
+    and more receptive to additional offerings.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -1195,8 +1242,17 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Identifies customers with sudden balance declines.
-    Sharp drops may indicate financial distress or income loss.
+    **Use case:** Balance velocity monitoring is a core component of early
+    warning systems (EWS) in commercial and retail banking. A >50% balance
+    decline in 7 days vs. the 30-60 day historical average triggers alerts
+    for relationship managers, enabling proactive intervention before
+    missed payments occur.
+    
+    **Interpreting results:** `balance_decline_pct` measures relative drop;
+    0.5 means balance halved, 0.8 means 80% decline. High values ordered
+    DESC surface the most urgent cases first. Note that the query compares
+    7-day recent vs. 30-60 day historical window, avoiding seasonal noise
+    from the most recent month.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -1404,8 +1460,17 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Analyzes credit risk based on social network connections.
-    Proximity to defaulted borrowers increases risk score.
+    **Use case:** Network-based credit scoring leverages graph relationships
+    to assess "guilt by association." Research shows that borrowers within
+    1-2 hops of defaulted peers have 2-3x higher default probability.
+    This is used as an auxiliary signal in credit decisioning, not as a
+    standalone criterion.
+    
+    **Interpreting results:** `defaulted_peers` counts distinct individuals
+    within 2 hops who have defaulted loans. `defaulted_loans` can be higher
+    if a single peer has multiple defaults. The undirected KNOWS relationship
+    captures bidirectional social ties. Customers with `defaulted_peers >= 3`
+    should be flagged for enhanced due diligence.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -1429,7 +1494,6 @@ Databricks SQL translation.
           e.customer_id AS start_node,
           e.knows_customer_id AS end_node,
           1 AS depth,
-          ARRAY(e.customer_id, e.knows_customer_id) AS path,
           ARRAY(e.customer_id) AS visited
         FROM catalog.credit.CustomerKnows e
     
@@ -1440,7 +1504,6 @@ Databricks SQL translation.
           e.knows_customer_id AS start_node,
           e.customer_id AS end_node,
           1 AS depth,
-          ARRAY(e.knows_customer_id, e.customer_id) AS path,
           ARRAY(e.knows_customer_id) AS visited
         FROM catalog.credit.CustomerKnows e
         )
@@ -1454,7 +1517,6 @@ Databricks SQL translation.
           p.start_node,
           e.knows_customer_id AS end_node,
           p.depth + 1 AS depth,
-          CONCAT(p.path, ARRAY(e.knows_customer_id)) AS path,
           CONCAT(p.visited, ARRAY(e.customer_id)) AS visited
         FROM paths_1 p
         JOIN catalog.credit.CustomerKnows e
@@ -1469,7 +1531,6 @@ Databricks SQL translation.
           p.start_node,
           e.customer_id AS end_node,
           p.depth + 1 AS depth,
-          CONCAT(p.path, ARRAY(e.customer_id)) AS path,
           CONCAT(p.visited, ARRAY(e.knows_customer_id)) AS visited
         FROM paths_1 p
         JOIN catalog.credit.CustomerKnows e
@@ -1520,7 +1581,6 @@ Databricks SQL translation.
               ,p.start_node
               ,p.end_node
               ,p.depth
-              ,p.path
             FROM paths_1 p
             JOIN catalog.credit.Customer sink
               ON sink.id = p.end_node
@@ -1630,8 +1690,16 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Estimates debt-to-income ratio from transaction patterns.
-    DTI is a critical metric for credit approval decisions.
+    **Use case:** Debt-to-income ratio (DTI) is a regulatory requirement
+    for mortgage lending (Qualified Mortgage rules cap DTI at 43%) and a
+    key underwriting metric for all consumer credit. This query estimates
+    DTI from transaction data when formal income documentation is unavailable,
+    enabling faster pre-qualification.
+    
+    **Interpreting results:** `estimated_dti` below 0.36 is generally
+    considered healthy. Between 0.36-0.43 is borderline. Above 0.43 exceeds
+    the QM threshold and indicates the customer may be overleveraged.
+    Results sorted DESC surface the highest-risk customers first.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -1835,8 +1903,16 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Identifies customers without loans but with strong deposit relationships.
-    Prime candidates for personal loan or credit card offers.
+    **Use case:** Cross-sell analytics identify untapped revenue from existing
+    deposit customers. Customers with no loan products but high deposit
+    balances across multiple accounts represent low-risk lending prospects,
+    since the bank already holds their primary financial relationship.
+    
+    **Interpreting results:** `avg_balance > 5000` with `account_count >= 2`
+    indicates a sticky, multi-product deposit customer. These customers have
+    low acquisition cost for lending products. The LIMIT 50 focuses outreach
+    on the top tier. The EXISTS-NOT pattern (`NOT (c)-[:HAS_LOAN]->(:Loan)`)
+    is key: it filters out customers who already have loans.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -1974,8 +2050,16 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Detects customers increasing loan payment amounts.
-    Indicates improved cash flow and reduced default risk.
+    **Use case:** Payment velocity analysis detects improving financial health.
+    Customers who increase payment amounts by >20% are likely experiencing
+    income growth or improved cash flow. This is used to identify candidates
+    for credit line increases or refinancing to a larger loan amount.
+    
+    **Interpreting results:** `payment_increase_pct` of 0.2 means 20% increase
+    in recent vs. historical payment amounts. Higher values indicate
+    stronger improvement. This is a positive signal -- opposite of the
+    early warning query. Combine with DTI data to confirm that increased
+    payments reflect improved capacity, not desperation to pay down debt.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -2204,8 +2288,17 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Finds credit cards with limits far exceeding usage patterns.
-    Reducing limits can decrease exposure while maintaining customer satisfaction.
+    **Use case:** Credit line management is a regulatory expectation under
+    OCC guidance. Unused credit limits represent contingent exposure on the
+    bank's balance sheet. Proactively reducing limits on cards where
+    max usage < 30% of limit reduces capital requirements (Basel III RWA)
+    while preserving adequate headroom for the customer.
+    
+    **Interpreting results:** `suggested_new_limit` is calculated as
+    `credit_limit - max_transaction * 3`, providing a 3x buffer over peak
+    usage. If `avg_transaction < credit_limit * 0.1`, the card is heavily
+    underutilized. Review these cases for potential limit reduction or
+    product migration to a lower-tier card.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -2421,8 +2514,17 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Identifies loans with rates significantly above current market.
-    Proactive refinancing offers can improve retention and customer satisfaction.
+    **Use case:** Retention-driven refinancing targets customers paying
+    above-market rates on seasoned loans (>2 years old). Offering a rate
+    reduction before the customer shops competitors prevents attrition.
+    The `annual_savings_potential` quantifies the value proposition for
+    each customer, enabling prioritized outreach.
+    
+    **Interpreting results:** `annual_savings_potential` estimates yearly
+    savings from the rate differential. Higher values represent stronger
+    customer incentive to refinance. `current_rate > market_rate + 1.0`
+    ensures only meaningful rate gaps are surfaced. Focus on high-balance
+    loans first, as these generate the most significant savings.
 
 ???+ note "OpenCypher Query"
     ```cypher
@@ -2578,8 +2680,17 @@ Databricks SQL translation.
 
 ??? note "Notes"
 
-    Examines financial strength of co-borrowers for joint loans.
-    Combined liquidity assessment provides more accurate risk picture.
+    **Use case:** Co-borrower analysis is essential for joint loan
+    underwriting. Regulatory guidance requires assessing both borrowers'
+    financial capacity. The graph pattern `c1 -> loan <- c2` naturally
+    captures the co-borrower relationship, and joining each borrower's
+    accounts provides a combined liquidity picture.
+    
+    **Interpreting results:** `combined_liquidity` sums both borrowers'
+    average balances. Higher combined liquidity relative to `l.balance`
+    indicates a safer loan. If one borrower's balance is significantly
+    lower, that borrower represents a concentration risk. The `c1.id < c2.id`
+    filter deduplicates pairs (avoids counting Alice-Bob and Bob-Alice).
 
 ???+ note "OpenCypher Query"
     ```cypher

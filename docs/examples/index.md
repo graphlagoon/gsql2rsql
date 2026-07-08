@@ -15,9 +15,9 @@ Each example shows the original OpenCypher query alongside the generated Databri
 
 ### [Credit](credit.md)
 
-- **Total Queries**: 15
+- **Total Queries**: 14
 - **Successful**: 14
-- **Failed**: 1
+- **Failed**: 0
 
 ### [Features](features.md)
 

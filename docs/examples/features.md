@@ -8,7 +8,7 @@ This page contains transpiled examples for **features queries** queries.
     these examples require further curation and validation,
     including the transpilation results. if you spot any issues,
     please open an issue or contribute at
-    [gsql2rsql/issues](https://github.com/devmessias/gsql2rsql/issues)
+    [gsql2rsql/issues](https://github.com/graphlagoon/gsql2rsql/issues)
 
 Each example shows the original OpenCypher query and its corresponding
 Databricks SQL translation.
@@ -2055,7 +2055,6 @@ Databricks SQL translation.
           e.person_id AS start_node,
           e.friend_id AS end_node,
           1 AS depth,
-          ARRAY(e.person_id, e.friend_id) AS path,
           ARRAY(e.person_id) AS visited
         FROM catalog.demo.Knows e
         JOIN catalog.demo.Person src ON src.id = e.person_id
@@ -2068,7 +2067,6 @@ Databricks SQL translation.
           p.start_node,
           e.friend_id AS end_node,
           p.depth + 1 AS depth,
-          CONCAT(p.path, ARRAY(e.friend_id)) AS path,
           CONCAT(p.visited, ARRAY(e.person_id)) AS visited
         FROM paths_1 p
         JOIN catalog.demo.Knows e
@@ -2086,21 +2084,12 @@ Databricks SQL translation.
         ,sink.nickname AS _gsql2rsql_f_nickname
         ,sink.salary AS _gsql2rsql_f_salary
         ,sink.active AS _gsql2rsql_f_active
-        ,source.id AS _gsql2rsql_p_id
-        ,source.name AS _gsql2rsql_p_name
-        ,source.age AS _gsql2rsql_p_age
-        ,source.nickname AS _gsql2rsql_p_nickname
-        ,source.salary AS _gsql2rsql_p_salary
-        ,source.active AS _gsql2rsql_p_active
         ,p.start_node
         ,p.end_node
         ,p.depth
-        ,p.path
       FROM paths_1 p
       JOIN catalog.demo.Person sink
         ON sink.id = p.end_node
-      JOIN catalog.demo.Person source
-        ON source.id = p.start_node
       WHERE p.depth >= 1 AND p.depth <= 3
     ) AS _proj
     GROUP BY TO_JSON(NAMED_STRUCT('_', _gsql2rsql_f_name))
@@ -2174,7 +2163,6 @@ Databricks SQL translation.
           n.id AS start_node,
           n.id AS end_node,
           0 AS depth,
-          ARRAY(n.id) AS path,
           ARRAY() AS visited
         FROM catalog.demo.Person n
         WHERE (n.name) = ('Alice')
@@ -2186,7 +2174,6 @@ Databricks SQL translation.
           e.person_id AS start_node,
           e.friend_id AS end_node,
           1 AS depth,
-          ARRAY(e.person_id, e.friend_id) AS path,
           ARRAY(e.person_id) AS visited
         FROM catalog.demo.Knows e
         JOIN catalog.demo.Person src ON src.id = e.person_id
@@ -2199,7 +2186,6 @@ Databricks SQL translation.
           p.start_node,
           e.friend_id AS end_node,
           p.depth + 1 AS depth,
-          CONCAT(p.path, ARRAY(e.friend_id)) AS path,
           CONCAT(p.visited, ARRAY(e.person_id)) AS visited
         FROM paths_1 p
         JOIN catalog.demo.Knows e
@@ -2217,21 +2203,12 @@ Databricks SQL translation.
         ,sink.nickname AS _gsql2rsql_f_nickname
         ,sink.salary AS _gsql2rsql_f_salary
         ,sink.active AS _gsql2rsql_f_active
-        ,source.id AS _gsql2rsql_p_id
-        ,source.name AS _gsql2rsql_p_name
-        ,source.age AS _gsql2rsql_p_age
-        ,source.nickname AS _gsql2rsql_p_nickname
-        ,source.salary AS _gsql2rsql_p_salary
-        ,source.active AS _gsql2rsql_p_active
         ,p.start_node
         ,p.end_node
         ,p.depth
-        ,p.path
       FROM paths_1 p
       JOIN catalog.demo.Person sink
         ON sink.id = p.end_node
-      JOIN catalog.demo.Person source
-        ON source.id = p.start_node
       WHERE p.depth >= 0 AND p.depth <= 2
     ) AS _proj
     GROUP BY TO_JSON(NAMED_STRUCT('_', _gsql2rsql_f_name))
@@ -3048,7 +3025,6 @@ Databricks SQL translation.
           e.person_id AS start_node,
           e.friend_id AS end_node,
           1 AS depth,
-          ARRAY(e.person_id, e.friend_id) AS path,
           ARRAY(e.person_id) AS visited
         FROM catalog.demo.Knows e
     
@@ -3059,7 +3035,6 @@ Databricks SQL translation.
           p.start_node,
           e.friend_id AS end_node,
           p.depth + 1 AS depth,
-          CONCAT(p.path, ARRAY(e.friend_id)) AS path,
           CONCAT(p.visited, ARRAY(e.person_id)) AS visited
         FROM paths_1 p
         JOIN catalog.demo.Knows e
@@ -3087,7 +3062,6 @@ Databricks SQL translation.
         ,p.start_node
         ,p.end_node
         ,p.depth
-        ,p.path
       FROM paths_1 p
       JOIN catalog.demo.Person sink
         ON sink.id = p.end_node
@@ -3297,7 +3271,6 @@ Databricks SQL translation.
           e.person_id AS start_node,
           e.friend_id AS end_node,
           1 AS depth,
-          ARRAY(e.person_id, e.friend_id) AS path,
           ARRAY(NAMED_STRUCT('person_id', e.person_id, 'friend_id', e.friend_id, 'since', e.since, 'strength', e.strength)) AS path_edges,
           ARRAY(e.person_id) AS visited
         FROM catalog.demo.Knows e
@@ -3311,7 +3284,6 @@ Databricks SQL translation.
           p.start_node,
           e.friend_id AS end_node,
           p.depth + 1 AS depth,
-          CONCAT(p.path, ARRAY(e.friend_id)) AS path,
           ARRAY_APPEND(p.path_edges, NAMED_STRUCT('person_id', e.person_id, 'friend_id', e.friend_id, 'since', e.since, 'strength', e.strength)) AS path_edges,
           CONCAT(p.visited, ARRAY(e.person_id)) AS visited
         FROM paths_1 p
@@ -3340,7 +3312,6 @@ Databricks SQL translation.
         ,p.start_node
         ,p.end_node
         ,p.depth
-        ,p.path AS _gsql2rsql_path_id
         ,p.path_edges AS _gsql2rsql_path_edges
       FROM paths_1 p
       JOIN catalog.demo.Person sink
@@ -4436,7 +4407,6 @@ Databricks SQL translation.
           e.person_id AS start_node,
           e.friend_id AS end_node,
           1 AS depth,
-          ARRAY(e.person_id, e.friend_id) AS path,
           ARRAY(e.person_id) AS visited
         FROM catalog.demo.Knows e
     
@@ -4447,7 +4417,6 @@ Databricks SQL translation.
           e.friend_id AS start_node,
           e.person_id AS end_node,
           1 AS depth,
-          ARRAY(e.friend_id, e.person_id) AS path,
           ARRAY(e.friend_id) AS visited
         FROM catalog.demo.Knows e
         )
@@ -4461,7 +4430,6 @@ Databricks SQL translation.
           p.start_node,
           e.friend_id AS end_node,
           p.depth + 1 AS depth,
-          CONCAT(p.path, ARRAY(e.friend_id)) AS path,
           CONCAT(p.visited, ARRAY(e.person_id)) AS visited
         FROM paths_1 p
         JOIN catalog.demo.Knows e
@@ -4476,7 +4444,6 @@ Databricks SQL translation.
           p.start_node,
           e.person_id AS end_node,
           p.depth + 1 AS depth,
-          CONCAT(p.path, ARRAY(e.person_id)) AS path,
           CONCAT(p.visited, ARRAY(e.friend_id)) AS visited
         FROM paths_1 p
         JOIN catalog.demo.Knows e
@@ -4490,17 +4457,14 @@ Databricks SQL translation.
       ,COUNT(DISTINCT _gsql2rsql_friend_id) AS tech_connections
     FROM (
       SELECT
-         _left_0._gsql2rsql_p_id AS _gsql2rsql_p_id
-        ,_left_0._gsql2rsql_p_name AS _gsql2rsql_p_name
+         _left_0._gsql2rsql_p_name AS _gsql2rsql_p_name
         ,_left_0._gsql2rsql_friend_id AS _gsql2rsql_friend_id
         ,_left_0._gsql2rsql__anon2_person_id AS _gsql2rsql__anon2_person_id
         ,_left_0._gsql2rsql__anon2_company_id AS _gsql2rsql__anon2_company_id
-        ,_right_0._gsql2rsql_c_id AS _gsql2rsql_c_id
         ,_right_0._gsql2rsql_c_industry AS _gsql2rsql_c_industry
       FROM (
         SELECT
-           _left_1._gsql2rsql_p_id AS _gsql2rsql_p_id
-          ,_left_1._gsql2rsql_p_name AS _gsql2rsql_p_name
+           _left_1._gsql2rsql_p_name AS _gsql2rsql_p_name
           ,_left_1._gsql2rsql_friend_id AS _gsql2rsql_friend_id
           ,_right_1._gsql2rsql__anon2_person_id AS _gsql2rsql__anon2_person_id
           ,_right_1._gsql2rsql__anon2_company_id AS _gsql2rsql__anon2_company_id
@@ -4521,7 +4485,6 @@ Databricks SQL translation.
             ,p.start_node
             ,p.end_node
             ,p.depth
-            ,p.path
           FROM paths_1 p
           JOIN catalog.demo.Person sink
             ON sink.id = p.end_node
@@ -5438,12 +5401,6 @@ Databricks SQL translation.
         ,sink.nickname AS _gsql2rsql_b_nickname
         ,sink.salary AS _gsql2rsql_b_salary
         ,sink.active AS _gsql2rsql_b_active
-        ,source.id AS _gsql2rsql_a_id
-        ,source.name AS _gsql2rsql_a_name
-        ,source.age AS _gsql2rsql_a_age
-        ,source.nickname AS _gsql2rsql_a_nickname
-        ,source.salary AS _gsql2rsql_a_salary
-        ,source.active AS _gsql2rsql_a_active
         ,p.start_node
         ,p.end_node
         ,p.depth
@@ -5452,8 +5409,6 @@ Databricks SQL translation.
       FROM paths_1 p
       JOIN catalog.demo.Person sink
         ON sink.id = p.end_node
-      JOIN catalog.demo.Person source
-        ON source.id = p.start_node
       WHERE p.depth >= 1 AND p.depth <= 3
     ) AS _proj
     ORDER BY hops ASC
@@ -6741,12 +6696,12 @@ Databricks SQL translation.
       SELECT
          _left_3.`a` AS `a`
         ,_left_3.`company_count` AS `company_count`
-        ,_right_3._gsql2rsql_friend_id AS _gsql2rsql_friend_id
+        ,_right_3._gsql2rsql__anon1_friend_id AS _gsql2rsql__anon1_friend_id
         ,_right_3._gsql2rsql_friend_name AS _gsql2rsql_friend_name
-        ,_right_3._gsql2rsql_a_id AS _gsql2rsql_a_id
         ,_right_3._gsql2rsql_a_name AS _gsql2rsql_a_name
         ,_right_3._gsql2rsql__anon1_person_id AS _gsql2rsql__anon1_person_id
-        ,_right_3._gsql2rsql__anon1_friend_id AS _gsql2rsql__anon1_friend_id
+        ,_right_3._gsql2rsql_friend_id AS _gsql2rsql_friend_id
+        ,_right_3._gsql2rsql_a_id AS _gsql2rsql_a_id
       FROM (
         SELECT
            `a`
