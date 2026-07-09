@@ -909,9 +909,20 @@ class ColumnResolver:
                 ):
                     # Schema lookup failed but entity_info confirms this is a NODE
                     # This can happen when nodes are projected through WITH clause after VLP
-                    # Use default node_id column name (commonly "node_id" for GraphContext)
+                    # Use the schema's real node ID column (hardcoding "node_id"
+                    # breaks custom schemas, e.g. vertex_key). After VLP the
+                    # field_name may already be fully prefixed — use it directly.
                     # See docs_help_dev/WITH_VLP_BUG_ANALYSIS.md for details
-                    sql_name = compute_sql_column_name(variable, "node_id")
+                    id_prop = "node_id"
+                    if (
+                        entry.entity_info.node_join_field is not None
+                        and entry.entity_info.node_join_field.field_name
+                    ):
+                        id_prop = entry.entity_info.node_join_field.field_name
+                    if id_prop.startswith("_gsql2rsql_"):
+                        sql_name = id_prop
+                    else:
+                        sql_name = compute_sql_column_name(variable, id_prop)
                 else:
                     # Relationship: use the schema's real source column as the
                     # primary identifier (edges don't have an 'id' column).

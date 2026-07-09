@@ -558,6 +558,43 @@ class TestReturnEdgeCustomColumns:
         assert struct_contains_field(sql, "source_node_id")
         assert struct_contains_field(sql, "target_node_id")
 
+    def test_vlp_with_node_custom_node_id_no_dangling_refs(self):
+        """Node propagated through WITH after VLP must use real node_id column.
+
+        Query: MATCH p = (a)-[*1..2]->(b) WITH b RETURN b
+        Bug: the resolver fallback for nodes after WITH+VLP hardcoded
+        'node_id', producing _gsql2rsql_b_node_id when the schema uses a
+        custom column (e.g. vertex_key) — UNRESOLVED_COLUMN at runtime.
+        """
+        g = GraphContext(
+            nodes_table="cat.sch.nodes",
+            edges_table="cat.sch.edges",
+            node_id_col="vertex_key",
+            node_type_col="kind",
+            edge_type_col="rel_kind",
+            edge_src_col="source_node_id",
+            edge_dst_col="target_node_id",
+            extra_node_attrs={"name": str},
+        )
+        g.set_types(node_types=["Person"], edge_types=["OWNS"])
+
+        sql = g.transpile("""
+            MATCH p = (a)-[*1..2]->(b)
+            WHERE a.vertex_key = 'A'
+            WITH b
+            RETURN b
+        """)
+
+        print(f"\n=== SQL ===\n{sql}")
+
+        dangling = dangling_struct_refs(sql, "b")
+        assert not dangling, (
+            f"References columns never materialized: {dangling}"
+        )
+        assert "_gsql2rsql_b_node_id" not in sql, (
+            "Must not reference hardcoded node_id column with custom schema"
+        )
+
     def test_return_edge_default_schema_unchanged(self, graph_context_minimal):
         """Default schema (src/dst) must keep 'src'/'dst' struct keys.
 

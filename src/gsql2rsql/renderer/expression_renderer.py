@@ -1225,13 +1225,23 @@ class ExpressionRenderer:
         if not entity_field:
             return None, props
 
+        def add_prop(pn: str) -> None:
+            # DEFENSIVE: after WITH boundaries (e.g. post-VLP), field_names may
+            # already be fully prefixed (e.g. _gsql2rsql_b_vertex_key). Use them
+            # directly and strip the prefix to recover the property key —
+            # re-prefixing would produce a dangling double-prefixed column.
+            if pn.startswith(prefix):
+                props.append((pn[len(prefix):], pn))
+            elif pn.startswith(self._ctx.COLUMN_PREFIX):
+                props.append((pn, pn))
+            else:
+                props.append((pn, f"{prefix}{pn}"))
+
         if entity_field.entity_type == EntityType.NODE:
             if entity_field.node_join_field:
-                pn = entity_field.node_join_field.field_name
-                props.append((pn, f"{prefix}{pn}"))
+                add_prop(entity_field.node_join_field.field_name)
             for pf in entity_field.encapsulated_fields:
-                pn = pf.field_name
-                props.append((pn, f"{prefix}{pn}"))
+                add_prop(pf.field_name)
         else:
             # Derive key/column from the schema's real source/sink column names
             # (mirrors the NODE branch). Hardcoding "src"/"dst" only works when
@@ -1239,14 +1249,11 @@ class ExpressionRenderer:
             # (e.g. source_node_id) it produced references to columns never
             # materialized in the inner projection (UNRESOLVED_COLUMN).
             if entity_field.rel_source_join_field:
-                pn = entity_field.rel_source_join_field.field_name
-                props.append((pn, f"{prefix}{pn}"))
+                add_prop(entity_field.rel_source_join_field.field_name)
             if entity_field.rel_sink_join_field:
-                pn = entity_field.rel_sink_join_field.field_name
-                props.append((pn, f"{prefix}{pn}"))
+                add_prop(entity_field.rel_sink_join_field.field_name)
             for pf in entity_field.encapsulated_fields:
-                pn = pf.field_name
-                props.append((pn, f"{prefix}{pn}"))
+                add_prop(pf.field_name)
 
         return entity_field, props
 
