@@ -2,6 +2,29 @@
 
 
 
+## v0.10.5 (2026-07-09)
+
+### Fix
+
+* fix(resolver): derive entity id/src/dst columns from schema instead of hardcoding
+
+Returning an entity (RETURN r/n, collect(r/n), WITH-propagated nodes after
+VLP) built column references from the literals &#34;src&#34;/&#34;dst&#34;/&#34;node_id&#34; instead
+of the schema&#39;s real column names. With a custom schema (e.g. edge_src_col=
+&#34;source_node_id&#34;, node_id_col=&#34;vertex_key&#34;) this emitted references to
+columns never materialized in the inner projection, failing at runtime with
+UNRESOLVED_COLUMN. Default schemas coincided with the literals, hiding the bug.
+
+Derive keys/columns from rel_source_join_field / rel_sink_join_field /
+node_join_field.field_name across all four sites (expression_renderer struct
+collector, column_resolver bare-entity fallback, sql_renderer required-column
+collection x2). Handle the post-WITH case where field_name arrives already
+prefixed to avoid double-prefixing.
+
+Default-schema output is byte-identical; struct keys for custom schemas now
+use the real column names (the old keys pointed at nonexistent columns). ([`b4a0220`](https://github.com/graphlagoon/gsql2rsql/commit/b4a02209fa98e1e6f80e4ec5c5a2f6587e6417a6))
+
+
 ## v0.10.4 (2026-07-08)
 
 ### Documentation

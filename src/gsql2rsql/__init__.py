@@ -8,7 +8,7 @@ from gsql2rsql.renderer.procedural_bfs_renderer import (
 )
 from gsql2rsql.renderer.sql_renderer import SQLRenderer
 
-__version__ = "0.10.4"
+__version__ = "0.10.5"
 __all__ = [
     "OpenCypherParser",
     "LogicalPlan",
