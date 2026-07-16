@@ -2,6 +2,17 @@
 
 
 
+## v0.11.0 (2026-07-16)
+
+### Feature
+
+* feat: claude skills ([`bff91e7`](https://github.com/graphlagoon/gsql2rsql/commit/bff91e7b18ba489c92bc2ae73acdb457aa4218bd))
+
+### Fix
+
+* fix: is_terminator and all unwind cond ([`6030cf4`](https://github.com/graphlagoon/gsql2rsql/commit/6030cf4d1164ac16a5c62f0e76c6dab0af8dacc0))
+
+
 ## v0.10.5 (2026-07-09)
 
 ### Fix
