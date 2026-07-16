@@ -136,6 +136,17 @@ class PathUsageInfo:
     # into the CTE, we should NOT also apply FORALL(path_edges, rel -> rel.amount > 1000)
     # at the end - that would be redundant.
     pushed_all_expressions: list[QueryExpression] = field(default_factory=list)
+    # Node predicates from ALL(n IN nodes(path) WHERE pred), where pred
+    # references ONLY the lambda variable and the ALL sits in a conjunctive
+    # WHERE position. Every path node must satisfy pred, and path nodes are
+    # exactly the endpoints of traversed edges (plus the lone start node at
+    # depth 0), so the renderer may traverse a pre-filtered edge set instead
+    # of the raw edge table. Unlike edge pushdown, this is an OPTIMIZATION
+    # ONLY: the original ALL is NEVER removed from the WHERE clause (it is
+    # rendered as a residual node-table subquery), so a renderer variant
+    # that skips the pushdown stays correct — just slower.
+    node_predicates: list[QueryExpression] = field(default_factory=list)
+    node_lambda_variable: str = ""
 
     @property
     def has_pushable_predicates(self) -> bool:
@@ -182,6 +193,31 @@ class PathUsageInfo:
 
         result = self.edge_predicates[0]
         for pred in self.edge_predicates[1:]:
+            result = QueryExpressionBinary(
+                left_expression=result,
+                right_expression=pred,
+                operator=and_operator,
+            )
+        return result
+
+    @property
+    def combined_node_predicate(self) -> QueryExpression | None:
+        """Combine all pushable node predicates with AND.
+
+        Mirrors ``combined_edge_predicate`` for ALL(n IN nodes(path) ...)
+        predicates eligible for filtered-edge-set pushdown.
+        """
+        if not self.node_predicates:
+            return None
+        if len(self.node_predicates) == 1:
+            return self.node_predicates[0]
+
+        and_operator = BinaryOperatorInfo(
+            name=BinaryOperator.AND,
+            operator_type=BinaryOperatorType.LOGICAL,
+        )
+        result = self.node_predicates[0]
+        for pred in self.node_predicates[1:]:
             result = QueryExpressionBinary(
                 left_expression=result,
                 right_expression=pred,
@@ -271,14 +307,18 @@ class PathExpressionAnalyzer:
         """
         info = PathUsageInfo(path_variable=path_variable)
 
-        # Analyze WHERE clause
+        # Analyze WHERE clause. The root of a WHERE clause is a conjunctive
+        # position: an ALL() found here (or under a chain of ANDs) must hold
+        # for the row to survive, so its predicate can be pushed into the CTE.
         if where_expr:
-            self._analyze_expression(where_expr, path_variable, info)
+            self._analyze_expression(where_expr, path_variable, info, conjunctive=True)
 
-        # Analyze RETURN expressions
+        # Analyze RETURN expressions. These are projected VALUES, never
+        # filters — an ALL() here must not prune traversal, so extraction
+        # is disabled (conjunctive=False). Collection flags still apply.
         if return_exprs:
             for expr in return_exprs:
-                self._analyze_expression(expr, path_variable, info)
+                self._analyze_expression(expr, path_variable, info, conjunctive=False)
 
         return info
 
@@ -287,6 +327,7 @@ class PathExpressionAnalyzer:
         expr: QueryExpression,
         path_var: str,
         info: PathUsageInfo,
+        conjunctive: bool = False,
     ) -> None:
         """Recursively analyze an expression for path variable usage.
 
@@ -296,7 +337,6 @@ class PathExpressionAnalyzer:
         1. relationships(path) function calls -> needs_edge_collection = True
         2. nodes(path) function calls -> needs_node_collection = True
         3. ALL(var IN relationships(path) WHERE pred) -> extract pred for pushdown
-        4. List comprehensions with relationships(path) -> extract filter for pushdown
 
         The traversal is exhaustive - we check ALL subexpressions to ensure
         we don't miss any path usage (e.g., nested in complex boolean expressions).
@@ -305,6 +345,15 @@ class PathExpressionAnalyzer:
             expr: The expression to analyze
             path_var: The path variable name to look for
             info: PathUsageInfo to update with findings
+            conjunctive: True only while this expression must hold for the
+                enclosing WHERE to be TRUE (the WHERE root and anything
+                reachable from it purely through AND). Predicate EXTRACTION
+                (pushdown) is gated on this: an ALL() under OR/XOR/NOT, in a
+                function argument, in a comparison operand, or in a RETURN
+                projection must not prune traversal — only ALL() in a
+                conjunctive position is pushable. Collection flags
+                (needs_edge_collection / needs_node_collection) are NOT
+                gated: they are position-independent.
         """
         if expr is None:
             return
@@ -350,8 +399,12 @@ class PathExpressionAnalyzer:
             if self._is_relationships_of_path(expr.list_expression, path_var):
                 info.needs_edge_collection = True
 
-                # Extract predicate for pushdown (only for ALL)
-                if (expr.predicate_type == ListPredicateType.ALL
+                # Extract predicate for pushdown (only for ALL, and only in
+                # a conjunctive position — under OR/NOT/XOR or in a RETURN
+                # projection, pushing it into the CTE would prune paths that
+                # the other branch / the projection still needs).
+                if (conjunctive
+                    and expr.predicate_type == ListPredicateType.ALL
                     and expr.filter_expression is not None):
                     # Store the predicate and variable name for rewriting
                     info.edge_predicates.append(expr.filter_expression)
@@ -361,38 +414,46 @@ class PathExpressionAnalyzer:
                     # removed from the WHERE clause after pushdown
                     # (it becomes redundant - the CTE already filters)
                     info.pushed_all_expressions.append(expr)
+            elif self._is_nodes_of_path(expr.list_expression, path_var):
+                info.needs_node_collection = True
+
+                # ALL over nodes(path): extractable when conjunctive AND the
+                # predicate reads nothing but the lambda variable (an outer
+                # reference would make the per-node check row-dependent).
+                # NOT added to pushed_all_expressions — the ALL stays in the
+                # WHERE clause as an always-correct residual; the pushdown
+                # only shrinks the traversed edge set.
+                if (conjunctive
+                    and expr.predicate_type == ListPredicateType.ALL
+                    and expr.filter_expression is not None
+                    and _references_only_variable(
+                        expr.filter_expression, expr.variable_name
+                    )):
+                    info.node_predicates.append(expr.filter_expression)
+                    if not info.node_lambda_variable:
+                        info.node_lambda_variable = expr.variable_name
 
         # -----------------------------------------------------------------
-        # Case 3: REDUCE expressions - REDUCE(acc = init, var IN list | expr)
+        # Cases 3 & 4: REDUCE and list comprehensions
         #
         # REDUCE(total = 0, r IN relationships(path) | total + r.amount)
-        #
-        # Cannot push down the reducer, but we need edge collection.
-        # -----------------------------------------------------------------
-        elif isinstance(expr, QueryExpressionReduce):
-            if self._is_relationships_of_path(expr.list_expression, path_var):
-                info.needs_edge_collection = True
-                # Note: REDUCE expressions cannot be pushed down as simple filters
-                # They require the full path to be available for aggregation
-
-        # -----------------------------------------------------------------
-        # Case 4: List comprehensions - [var IN list WHERE pred | map_expr]
+        # [r IN relationships(path) WHERE r.valid | r.id]
         #
         # [r IN relationships(path) WHERE r.valid | r.id]
-        #                                 ^^^^^^^
-        #                                 filter_expression (pushable!)
         #
-        # The filter part can be pushed down similar to ALL predicates.
+        # Like REDUCE, the comprehension filter is NOT pushable: it selects
+        # a SUBLIST of each path's edges — it does not constrain which paths
+        # exist. Pushing it into the CTE would drop every path containing a
+        # non-matching edge, e.g. a path with one invalid edge should still
+        # be returned (with that edge filtered out of the projected list),
+        # not eliminated. The FILTER() is applied post-CTE by the
+        # expression renderer.
         # -----------------------------------------------------------------
-        elif isinstance(expr, QueryExpressionListComprehension):
+        elif isinstance(
+            expr, (QueryExpressionReduce, QueryExpressionListComprehension)
+        ):
             if self._is_relationships_of_path(expr.list_expression, path_var):
                 info.needs_edge_collection = True
-
-                # Extract filter predicate for pushdown
-                if expr.filter_expression is not None:
-                    info.edge_predicates.append(expr.filter_expression)
-                    if not info.edge_lambda_variable:
-                        info.edge_lambda_variable = expr.variable_name
 
         # -----------------------------------------------------------------
         # Recurse into all child expressions
@@ -401,10 +462,25 @@ class PathExpressionAnalyzer:
         #   WHERE a.x > 1 AND ALL(r IN relationships(path) WHERE r.y > 2)
         #                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
         #                     Nested inside an AND expression
+        #
+        # Conjunctive-ness propagates ONLY through AND: both operands of an
+        # AND must hold whenever the AND holds. Everything else (OR/XOR
+        # operands, NOT/other function arguments, comparison operands,
+        # CASE branches, list/lambda bodies) is a non-conjunctive context —
+        # an ALL() found there is detected for collection purposes but is
+        # not extractable for pushdown.
         # -----------------------------------------------------------------
+        child_conjunctive = (
+            conjunctive
+            and isinstance(expr, QueryExpressionBinary)
+            and expr.operator is not None
+            and expr.operator.name == BinaryOperator.AND
+        )
         for child in expr.children:
             if isinstance(child, QueryExpression):
-                self._analyze_expression(child, path_var, info)
+                self._analyze_expression(
+                    child, path_var, info, conjunctive=child_conjunctive
+                )
 
     def _references_path_variable(
         self,
@@ -461,6 +537,35 @@ class PathExpressionAnalyzer:
             if expr.function and expr.function == Function.RELATIONSHIPS:
                 return self._references_path_variable(expr.parameters, path_var)
         return False
+
+    def _is_nodes_of_path(
+        self,
+        expr: QueryExpression,
+        path_var: str,
+    ) -> bool:
+        """Check if expression is specifically nodes(path_var)."""
+        if isinstance(expr, QueryExpressionFunction):
+            if expr.function and expr.function == Function.NODES:
+                return self._references_path_variable(expr.parameters, path_var)
+        return False
+
+
+def _references_only_variable(
+    expr: QueryExpression, lambda_var: str
+) -> bool:
+    """True if every variable reference in ``expr`` is ``lambda_var``.
+
+    A predicate that also reads outer variables (e.g. ``n.x > d.limit``)
+    cannot be evaluated per node against the node table alone, so it is
+    not eligible for node-predicate pushdown.
+    """
+    if isinstance(expr, QueryExpressionProperty):
+        return expr.variable_name == lambda_var
+    for child in expr.children:
+        if isinstance(child, QueryExpression):
+            if not _references_only_variable(child, lambda_var):
+                return False
+    return True
 
 
 def rewrite_predicate_for_edge_alias(

@@ -40,8 +40,12 @@ from gsql2rsql.parser.ast import (
     NodeEntity,
     QueryExpression,
     QueryExpressionExists,
+    QueryExpressionFunction,
+    QueryExpressionListPredicate,
+    QueryExpressionProperty,
     RelationshipEntity,
 )
+from gsql2rsql.parser.operators import Function
 from gsql2rsql.planner.logical_plan import LogicalPlan
 from gsql2rsql.planner.operators import (
     DataSourceOperator,
@@ -57,7 +61,6 @@ from gsql2rsql.planner.path_analyzer import (
 )
 from gsql2rsql.planner.schema import EntityField
 from gsql2rsql.renderer.schema_provider import ISQLDBSchemaProvider, SQLTableDescriptor
-
 
 # ---------------------------------------------------------------------------
 # Enriched metadata dataclasses (immutable, produced by SQLEnrichmentPass)
@@ -136,6 +139,14 @@ class EnrichedRecursiveOp:
     sink_filter_as_sink: QueryExpression | None = None
     # Barrier filter (is_terminator directive) rewritten for "barrier" alias
     barrier_filter_as_barrier: QueryExpression | None = None
+    # Node predicate pushdown: from ALL(n IN nodes(path) WHERE pred).
+    # When node_pushdown_node is set, the CTE renderer may traverse a
+    # pre-filtered edge set (both edge endpoints satisfy the predicate)
+    # instead of the raw edge table. OPTIMIZATION ONLY — the originating
+    # ALL always stays in the final WHERE as a residual subquery, so a
+    # renderer that ignores these fields is slower, never wrong.
+    node_filter_as_nf: QueryExpression | None = None
+    node_pushdown_node: EnrichedNodeInfo | None = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +170,27 @@ class EnrichedExistsExpr:
 
 
 @dataclass(frozen=True)
+class EnrichedNodesListPredicate:
+    """SQL-resolved metadata for a list predicate over ``nodes(path)``.
+
+    Covers ``ALL/ANY/NONE/SINGLE(n IN nodes(p) WHERE <property predicate>)``.
+    The path array stores scalar node IDs, so a property-accessing lambda
+    cannot be rendered as a HOF (``FORALL(path, n -> n.prop)`` is a type
+    error in Spark). The expression renderer instead emits a correlated
+    subquery against the node table; this dataclass carries the resolved
+    table metadata so the renderer never touches ``db_schema``.
+
+    Keyed by ``id(expr)`` in ``EnrichedPlanData.nodes_predicates``.
+    """
+
+    node_table_name: str
+    node_id_column: str
+    # Bare-column type filter (e.g. "node_type = 'Person'"); prefix with the
+    # subquery alias when emitting. None when the traversal is untyped.
+    node_type_filter: str | None = None
+
+
+@dataclass(frozen=True)
 class EnrichedPlanData:
     """Immutable SQL-resolved metadata for the entire plan.
 
@@ -174,6 +206,9 @@ class EnrichedPlanData:
     edge_infos: dict[int, list[EnrichedEdgeInfo]] = field(default_factory=dict)
     recursive_ops: dict[int, EnrichedRecursiveOp] = field(default_factory=dict)
     exists_exprs: dict[int, EnrichedExistsExpr] = field(default_factory=dict)
+    nodes_predicates: dict[int, EnrichedNodesListPredicate] = field(
+        default_factory=dict
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -205,12 +240,17 @@ class SQLEnrichmentPass:
         edge_infos: dict[int, list[EnrichedEdgeInfo]] = {}
         recursive_ops: dict[int, EnrichedRecursiveOp] = {}
         exists_exprs: dict[int, EnrichedExistsExpr] = {}
+        nodes_predicates: dict[int, EnrichedNodesListPredicate] = {}
+        # path variable name -> its RecursiveTraversalOperator. Filled while
+        # walking (bottom-up), so it is populated before the Selection /
+        # Projection operators above the traversal are enriched.
+        path_var_map: dict[str, RecursiveTraversalOperator] = {}
 
         visited: set[int] = set()
         for terminal in plan.terminal_operators:
             self._walk(
                 terminal, visited, data_sources, join_pairs, edge_infos,
-                recursive_ops, exists_exprs,
+                recursive_ops, exists_exprs, nodes_predicates, path_var_map,
             )
 
         return EnrichedPlanData(
@@ -219,6 +259,7 @@ class SQLEnrichmentPass:
             edge_infos=edge_infos,
             recursive_ops=recursive_ops,
             exists_exprs=exists_exprs,
+            nodes_predicates=nodes_predicates,
         )
 
     def _walk(
@@ -230,6 +271,8 @@ class SQLEnrichmentPass:
         edge_infos: dict[int, list[EnrichedEdgeInfo]],
         recursive_ops: dict[int, EnrichedRecursiveOp],
         exists_exprs: dict[int, EnrichedExistsExpr],
+        nodes_predicates: dict[int, EnrichedNodesListPredicate],
+        path_var_map: dict[str, RecursiveTraversalOperator],
     ) -> None:
         """Bottom-up walk: enrich children first, then current operator."""
         op_id = op.operator_debug_id
@@ -240,12 +283,12 @@ class SQLEnrichmentPass:
         for child in op.in_operators:
             self._walk(
                 child, visited, data_sources, join_pairs, edge_infos,
-                recursive_ops, exists_exprs,
+                recursive_ops, exists_exprs, nodes_predicates, path_var_map,
             )
 
         self._enrich_one(
             op, data_sources, join_pairs, edge_infos, recursive_ops,
-            exists_exprs,
+            exists_exprs, nodes_predicates, path_var_map,
         )
 
     def _enrich_one(
@@ -256,6 +299,8 @@ class SQLEnrichmentPass:
         edge_infos: dict[int, list[EnrichedEdgeInfo]],
         recursive_ops: dict[int, EnrichedRecursiveOp],
         exists_exprs: dict[int, EnrichedExistsExpr],
+        nodes_predicates: dict[int, EnrichedNodesListPredicate],
+        path_var_map: dict[str, RecursiveTraversalOperator],
     ) -> None:
         """Dispatch to type-specific enrichment."""
         if isinstance(op, DataSourceOperator):
@@ -264,9 +309,15 @@ class SQLEnrichmentPass:
             self._enrich_join(op, join_pairs)
         elif isinstance(op, RecursiveTraversalOperator):
             self._enrich_recursive(op, recursive_ops)
+            if op.path_variable:
+                path_var_map[op.path_variable] = op
 
         # Walk expression trees for EXISTS sub-expressions (any operator type)
         self._enrich_exists_in_operator(op, exists_exprs)
+        # Walk expression trees for list predicates over nodes(path)
+        self._enrich_nodes_predicates_in_operator(
+            op, nodes_predicates, path_var_map
+        )
 
     # ------------------------------------------------------------------
     # Type-specific enrichment methods (stubs for incremental migration)
@@ -513,6 +564,26 @@ class SQLEnrichmentPass:
                 edge_alias="barrier",
             )
 
+        # Node predicate pushdown eligibility. Conservative: only the
+        # single-edge-table case with the plain (non-bidirectional-BFS)
+        # rendering path. Everything else keeps correctness via the
+        # residual subquery in the final WHERE.
+        node_filter_as_nf = None
+        node_pushdown_node = None
+        if (
+            op.node_filter is not None
+            and op.node_filter_lambda_var
+            and single_table
+            and getattr(op, "bidirectional_bfs_mode", "off") == "off"
+        ):
+            pushdown_node = self._resolve_node_info(WILDCARD_NODE_TYPE)
+            if pushdown_node is not None:
+                node_filter_as_nf = rewrite_predicate_for_edge_alias(
+                    op.node_filter, op.node_filter_lambda_var,
+                    edge_alias="nf",
+                )
+                node_pushdown_node = pushdown_node
+
         recursive_ops[op.operator_debug_id] = EnrichedRecursiveOp(
             edge_tables=tuple(edge_tables),
             source_id_col=source_id_col,
@@ -529,6 +600,8 @@ class SQLEnrichmentPass:
             sink_filter_as_tgt=sink_filter_as_tgt,
             sink_filter_as_sink=sink_filter_as_sink,
             barrier_filter_as_barrier=barrier_filter_as_barrier,
+            node_filter_as_nf=node_filter_as_nf,
+            node_pushdown_node=node_pushdown_node,
         )
 
     def _resolve_node_info(self, node_type: str) -> EnrichedNodeInfo | None:
@@ -587,6 +660,94 @@ class SQLEnrichmentPass:
                     enriched = self._enrich_exists_expr(exists_expr)
                     if enriched is not None:
                         exists_exprs[expr_id] = enriched
+
+    # ------------------------------------------------------------------
+    # nodes(path) list-predicate enrichment
+    # ------------------------------------------------------------------
+
+    def _enrich_nodes_predicates_in_operator(
+        self,
+        op: LogicalOperator,
+        nodes_predicates: dict[int, EnrichedNodesListPredicate],
+        path_var_map: dict[str, RecursiveTraversalOperator],
+    ) -> None:
+        """Find list predicates over ``nodes(path)`` in expression trees.
+
+        Only predicates whose lambda body accesses PROPERTIES of the lambda
+        variable need enrichment — pure-ID lambdas (``n = value``) render
+        fine as HOFs over the scalar path array and are left alone.
+        """
+        if not path_var_map:
+            return
+
+        expressions: list[QueryExpression] = []
+        if isinstance(op, SelectionOperator) and op.filter_expression:
+            expressions.append(op.filter_expression)
+        if isinstance(op, ProjectionOperator):
+            if op.filter_expression:
+                expressions.append(op.filter_expression)
+            if op.having_expression:
+                expressions.append(op.having_expression)
+            for _alias, proj_expr in op.projections:
+                if proj_expr:
+                    expressions.append(proj_expr)
+
+        for expr_root in expressions:
+            for lp in expr_root.get_children_query_expression_type(
+                QueryExpressionListPredicate
+            ):
+                expr_id = id(lp)
+                if expr_id in nodes_predicates:
+                    continue
+                path_op = self._match_nodes_of_path(lp, path_var_map)
+                if path_op is None:
+                    continue
+                if not _lambda_accesses_properties(
+                    lp.filter_expression, lp.variable_name
+                ):
+                    continue
+                enriched = self._enrich_nodes_predicate(path_op)
+                if enriched is not None:
+                    nodes_predicates[expr_id] = enriched
+
+    def _match_nodes_of_path(
+        self,
+        lp: QueryExpressionListPredicate,
+        path_var_map: dict[str, RecursiveTraversalOperator],
+    ) -> RecursiveTraversalOperator | None:
+        """Return the traversal op if ``lp`` iterates ``nodes(<path var>)``."""
+        list_expr = lp.list_expression
+        if not isinstance(list_expr, QueryExpressionFunction):
+            return None
+        if list_expr.function != Function.NODES:
+            return None
+        for param in list_expr.parameters:
+            if (
+                isinstance(param, QueryExpressionProperty)
+                and not param.property_name
+                and param.variable_name in path_var_map
+            ):
+                return path_var_map[param.variable_name]
+        return None
+
+    def _enrich_nodes_predicate(
+        self, path_op: RecursiveTraversalOperator
+    ) -> EnrichedNodesListPredicate | None:
+        """Resolve the node table used to look up path node properties.
+
+        ``nodes(path)`` covers every node the traversal visits —
+        intermediate nodes are not constrained to the source/target types —
+        so the wildcard node table (the full node set) is the correct
+        lookup target, with no type filter.
+        """
+        node_info = self._resolve_node_info(WILDCARD_NODE_TYPE)
+        if node_info is None:
+            return None
+        return EnrichedNodesListPredicate(
+            node_table_name=node_info.table_descriptor.full_table_name,
+            node_id_column=node_info.id_column,
+            node_type_filter=None,
+        )
 
     def _enrich_exists_expr(
         self, expr: QueryExpressionExists
@@ -696,3 +857,34 @@ class SQLEnrichmentPass:
             target_node_id_col=target_node_id_col,
             source_node_id_col=source_node_id_col,
         )
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _lambda_accesses_properties(
+    filter_expression: QueryExpression | None, lambda_var: str
+) -> bool:
+    """True if the lambda body reads a PROPERTY of the lambda variable.
+
+    ``ALL(n IN nodes(p) WHERE n.status = 'A')`` -> True (needs node table).
+    ``ANY(n IN nodes(p) WHERE n = 42)``         -> False (IDs suffice; the
+    existing HOF/ARRAY_CONTAINS rendering over the scalar path array is
+    both valid and faster).
+    """
+    if filter_expression is None:
+        return False
+    if (
+        isinstance(filter_expression, QueryExpressionProperty)
+        and filter_expression.variable_name == lambda_var
+        and filter_expression.property_name
+    ):
+        return True
+    for child in filter_expression.children:
+        if isinstance(child, QueryExpression) and _lambda_accesses_properties(
+            child, lambda_var
+        ):
+            return True
+    return False

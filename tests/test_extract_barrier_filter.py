@@ -74,6 +74,14 @@ def is_terminator(inner: QueryExpression) -> QueryExpressionFunction:
     )
 
 
+def not_(inner: QueryExpression) -> QueryExpressionFunction:
+    return QueryExpressionFunction(
+        function=Function.NOT,
+        parameters=[inner],
+        data_type=bool,
+    )
+
+
 # Reusable leaf expressions
 A_ID = eq(prop("a", "node_id"), lit_str("N1"))
 B_HUB = eq(prop("b", "is_hub"), lit_bool(True))
@@ -124,6 +132,52 @@ class TestExtractBarrierFilter:
         assert barrier is None
         # The is_terminator call remains in remaining
         assert remaining is not None
+
+    def test_not_wrapped_terminator_alone(self):
+        """NOT is_terminator(P) alone -> barrier is NOT(P), remaining None.
+
+        Semantics: NOT is_terminator(P) == is_terminator(NOT P) — the barrier
+        fires where P is false.
+        """
+        inner = eq(prop("b", "is_hub"), lit_bool(True))
+        expr = not_(is_terminator(inner))
+
+        barrier, remaining = extract_barrier_filter(expr, "b")
+        assert barrier is not None
+        assert isinstance(barrier, QueryExpressionFunction)
+        assert barrier.function == Function.NOT
+        assert barrier.parameters == [inner]
+        assert remaining is None
+
+    def test_not_wrapped_terminator_in_and(self):
+        """a.id AND NOT is_terminator(b.hub) -> barrier NOT(b.hub), a.id kept."""
+        inner = eq(prop("b", "is_hub"), lit_bool(True))
+        expr = and_(A_ID, not_(is_terminator(inner)))
+
+        barrier, remaining = extract_barrier_filter(expr, "b")
+        assert barrier is not None
+        assert isinstance(barrier, QueryExpressionFunction)
+        assert barrier.function == Function.NOT
+        assert barrier.parameters == [inner]
+        assert remaining is A_ID
+
+    def test_not_wrapped_terminator_wrong_alias_left_in_where(self):
+        """NOT is_terminator(a.x = 1) with wrong alias stays in WHERE."""
+        inner = eq(prop("a", "x"), lit_int(1))
+        expr = and_(A_ID, not_(is_terminator(inner)))
+
+        barrier, remaining = extract_barrier_filter(expr, "b")
+        assert barrier is None
+        assert remaining is not None
+
+    def test_double_not_is_not_unwrapped(self):
+        """NOT NOT is_terminator(P) is not treated as a barrier directive."""
+        inner = eq(prop("b", "is_hub"), lit_bool(True))
+        expr = not_(not_(is_terminator(inner)))
+
+        barrier, remaining = extract_barrier_filter(expr, "b")
+        assert barrier is None
+        assert remaining is expr
 
     def test_extract_barrier_with_parsed_cypher(self):
         """Integration: real parser produces correct extraction."""

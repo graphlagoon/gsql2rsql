@@ -370,6 +370,7 @@ class GraphContext:
             "temp_tables", "numbered_views"
         ] = "temp_tables",
         procedural_optimizations: "ProceduralBFSOptimizations | None" = None,
+        config: dict[str, object] | None = None,
     ) -> str:
         """Transpile OpenCypher query to Databricks SQL.
 
@@ -385,6 +386,11 @@ class GraphContext:
                 Bidirectional BFS is only applied when BOTH source AND target
                 have equality filters on their ID columns. Enables large-scale
                 queries that would exceed Spark's row limits.
+            config: Optional renderer configuration dictionary. Supported keys:
+                - 'enable_vlp_node_pushdown' (bool, default True): traverse a
+                  pre-filtered edge set when the query has a conjunctive
+                  all(n IN nodes(p) WHERE ...) predicate. Optimization only;
+                  disabling it never changes results.
 
         Returns:
             Databricks SQL query string
@@ -414,12 +420,15 @@ class GraphContext:
             or self._vlp_rendering_mode != vlp_rendering_mode
             or self._materialization_strategy != materialization_strategy
             or self._procedural_optimizations != procedural_optimizations
+            or getattr(self, "_renderer_config", None) != config
         ):
             self._vlp_rendering_mode = vlp_rendering_mode
             self._materialization_strategy = materialization_strategy
             self._procedural_optimizations = procedural_optimizations
+            self._renderer_config = config
             self._renderer = SQLRenderer(
                 db_schema_provider=self._schema,
+                config=config,
                 vlp_rendering_mode=vlp_rendering_mode,
                 materialization_strategy=materialization_strategy,
                 procedural_optimizations=procedural_optimizations,

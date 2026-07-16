@@ -262,9 +262,13 @@ class TestPathExpressionAnalyzer:
     def test_list_comprehension_with_filter(
         self, analyzer: PathExpressionAnalyzer
     ) -> None:
-        """[r IN relationships(path) WHERE filter | expr] extracts filter.
+        """[r IN relationships(path) WHERE filter | expr] does NOT push down.
 
-        List comprehension filters can be pushed down similar to ALL.
+        The comprehension filter selects a sublist of each path's edges;
+        it does not constrain which paths exist. Pushing it into the CTE
+        would eliminate paths containing any non-matching edge, which is
+        wrong — those paths must still be returned with the non-matching
+        edges filtered out of the projected list only.
         """
         rels_expr = QueryExpressionFunction(
             function=Function.RELATIONSHIPS,
@@ -299,8 +303,8 @@ class TestPathExpressionAnalyzer:
         )
 
         assert info.needs_edge_collection is True
-        assert len(info.edge_predicates) == 1
-        assert info.edge_lambda_variable == "r"
+        assert len(info.edge_predicates) == 0
+        assert len(info.pushed_all_expressions) == 0
 
     def test_nested_expression_finds_path_usage(
         self, analyzer: PathExpressionAnalyzer
@@ -360,6 +364,182 @@ class TestPathExpressionAnalyzer:
 
         assert info.needs_edge_collection is True
         assert len(info.edge_predicates) == 1
+
+    def _make_all_relationships_expr(
+        self, path_var: str = "path", lambda_var: str = "r"
+    ) -> QueryExpressionListPredicate:
+        """Build ALL(r IN relationships(path) WHERE r.amount > 1000)."""
+        rels_expr = QueryExpressionFunction(
+            function=Function.RELATIONSHIPS,
+            parameters=[
+                QueryExpressionProperty(variable_name=path_var, property_name="")
+            ],
+        )
+        pred = QueryExpressionBinary(
+            left_expression=QueryExpressionProperty(
+                variable_name=lambda_var, property_name="amount"
+            ),
+            right_expression=QueryExpressionValue(value=1000, value_type=int),
+            operator=BinaryOperatorInfo(
+                name=BinaryOperator.GT,
+                operator_type=BinaryOperatorType.COMPARISON,
+            ),
+        )
+        return QueryExpressionListPredicate(
+            predicate_type=ListPredicateType.ALL,
+            variable_name=lambda_var,
+            list_expression=rels_expr,
+            filter_expression=pred,
+        )
+
+    def test_all_under_or_not_extracted(
+        self, analyzer: PathExpressionAnalyzer
+    ) -> None:
+        """ALL(...) under OR must NOT be extracted for pushdown.
+
+        Pushing it into the CTE would prune paths that could satisfy
+        the OTHER branch of the OR, producing wrong results:
+            WHERE ALL(r IN relationships(p) WHERE r.amount > 1000)
+               OR b.name = 'X'
+        """
+        all_expr = self._make_all_relationships_expr()
+        other_pred = QueryExpressionBinary(
+            left_expression=QueryExpressionProperty(
+                variable_name="b", property_name="name"
+            ),
+            right_expression=QueryExpressionValue(value="X", value_type=str),
+            operator=BinaryOperatorInfo(
+                name=BinaryOperator.EQ,
+                operator_type=BinaryOperatorType.COMPARISON,
+            ),
+        )
+        or_expr = QueryExpressionBinary(
+            left_expression=all_expr,
+            right_expression=other_pred,
+            operator=BinaryOperatorInfo(
+                name=BinaryOperator.OR,
+                operator_type=BinaryOperatorType.LOGICAL,
+            ),
+        )
+
+        info = analyzer.analyze(
+            path_variable="path",
+            where_expr=or_expr,
+            return_exprs=None,
+        )
+
+        # Collection is still needed (FORALL evaluated post-CTE)...
+        assert info.needs_edge_collection is True
+        # ...but nothing may be pushed into the CTE.
+        assert len(info.edge_predicates) == 0
+        assert len(info.pushed_all_expressions) == 0
+
+    def test_all_under_and_under_or_not_extracted(
+        self, analyzer: PathExpressionAnalyzer
+    ) -> None:
+        """(x AND ALL(...)) OR y — the AND is inside an OR, so no pushdown."""
+        all_expr = self._make_all_relationships_expr()
+        x_pred = QueryExpressionBinary(
+            left_expression=QueryExpressionProperty(
+                variable_name="a", property_name="x"
+            ),
+            right_expression=QueryExpressionValue(value=1, value_type=int),
+            operator=BinaryOperatorInfo(
+                name=BinaryOperator.GT,
+                operator_type=BinaryOperatorType.COMPARISON,
+            ),
+        )
+        inner_and = QueryExpressionBinary(
+            left_expression=x_pred,
+            right_expression=all_expr,
+            operator=BinaryOperatorInfo(
+                name=BinaryOperator.AND,
+                operator_type=BinaryOperatorType.LOGICAL,
+            ),
+        )
+        y_pred = QueryExpressionBinary(
+            left_expression=QueryExpressionProperty(
+                variable_name="b", property_name="y"
+            ),
+            right_expression=QueryExpressionValue(value=2, value_type=int),
+            operator=BinaryOperatorInfo(
+                name=BinaryOperator.GT,
+                operator_type=BinaryOperatorType.COMPARISON,
+            ),
+        )
+        or_expr = QueryExpressionBinary(
+            left_expression=inner_and,
+            right_expression=y_pred,
+            operator=BinaryOperatorInfo(
+                name=BinaryOperator.OR,
+                operator_type=BinaryOperatorType.LOGICAL,
+            ),
+        )
+
+        info = analyzer.analyze(
+            path_variable="path",
+            where_expr=or_expr,
+            return_exprs=None,
+        )
+
+        assert info.needs_edge_collection is True
+        assert len(info.edge_predicates) == 0
+        assert len(info.pushed_all_expressions) == 0
+
+    def test_all_under_not_function_not_extracted(
+        self, analyzer: PathExpressionAnalyzer
+    ) -> None:
+        """NOT(ALL(...)) must NOT be extracted — pushdown would invert semantics."""
+        all_expr = self._make_all_relationships_expr()
+        not_expr = QueryExpressionFunction(
+            function=Function.NOT,
+            parameters=[all_expr],
+        )
+
+        info = analyzer.analyze(
+            path_variable="path",
+            where_expr=not_expr,
+            return_exprs=None,
+        )
+
+        assert info.needs_edge_collection is True
+        assert len(info.edge_predicates) == 0
+        assert len(info.pushed_all_expressions) == 0
+
+    def test_all_in_return_position_not_extracted(
+        self, analyzer: PathExpressionAnalyzer
+    ) -> None:
+        """RETURN all(...) AS flag must NOT prune traversal.
+
+        The RETURN expression is a projected value, not a filter.
+        Pushing it down would restrict which paths exist at all.
+        """
+        all_expr = self._make_all_relationships_expr()
+
+        info = analyzer.analyze(
+            path_variable="path",
+            where_expr=None,
+            return_exprs=[all_expr],
+        )
+
+        assert info.needs_edge_collection is True
+        assert len(info.edge_predicates) == 0
+        assert len(info.pushed_all_expressions) == 0
+
+    def test_all_at_where_root_still_extracted(
+        self, analyzer: PathExpressionAnalyzer
+    ) -> None:
+        """Regression guard: conjunctive extraction still works at WHERE root."""
+        all_expr = self._make_all_relationships_expr()
+
+        info = analyzer.analyze(
+            path_variable="path",
+            where_expr=all_expr,
+            return_exprs=None,
+        )
+
+        assert len(info.edge_predicates) == 1
+        assert len(info.pushed_all_expressions) == 1
 
     def test_multiple_all_predicates_combined(
         self, analyzer: PathExpressionAnalyzer

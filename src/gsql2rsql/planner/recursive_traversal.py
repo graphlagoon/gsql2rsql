@@ -302,6 +302,9 @@ def create_recursive_match_tree(
         # Predicate pushdown: Filter edges DURING CTE recursion
         edge_filter=path_info.combined_edge_predicate,
         edge_filter_lambda_var=path_info.edge_lambda_variable,
+        # Node predicate pushdown (optimization only; residual kept in WHERE)
+        node_filter=path_info.combined_node_predicate,
+        node_filter_lambda_var=path_info.node_lambda_variable,
         # Direction for undirected traversal support
         direction=rel.direction,
         # Planner decision: use internal UNION for bidirectional traversal
@@ -466,10 +469,11 @@ def extract_source_node_filter(
         return None, None
 
     # Check if the entire expression references only the source node
-    # (but never extract is_terminator() — it's a barrier directive)
+    # (but never extract anything containing is_terminator() — it's a
+    # barrier directive, possibly NOT-wrapped)
     if (
         _references_only_variable(where_expr, source_alias)
-        and not _is_terminator_call(where_expr)
+        and not _contains_is_terminator(where_expr)
     ):
         return where_expr, None
 
@@ -485,7 +489,7 @@ def extract_source_node_filter(
     for conjunct in conjuncts:
         if (
             _references_only_variable(conjunct, source_alias)
-            and not _is_terminator_call(conjunct)
+            and not _contains_is_terminator(conjunct)
         ):
             source_parts.append(conjunct)
         else:
@@ -499,14 +503,61 @@ def extract_source_node_filter(
     return extracted, remaining
 
 
+def _match_terminator_conjunct(
+    conjunct: QueryExpression,
+    target_alias: str,
+) -> QueryExpression | None:
+    """Match a conjunct as a barrier directive; return its predicate.
+
+    Accepts two forms:
+    - `is_terminator(P)` -> returns P
+    - `NOT is_terminator(P)` -> returns NOT(P); the barrier fires where
+      P is false (NOT is_terminator(P) == is_terminator(NOT P))
+
+    Returns None when the conjunct is not a barrier directive or its
+    inner predicate does not reference only `target_alias`.
+    """
+    negated = False
+    call = conjunct
+    if (
+        isinstance(call, QueryExpressionFunction)
+        and call.function == Function.NOT
+        and len(call.parameters) == 1
+    ):
+        negated = True
+        call = call.parameters[0]
+
+    if not (
+        isinstance(call, QueryExpressionFunction)
+        and call.function == Function.IS_TERMINATOR
+        and len(call.parameters) == 1
+    ):
+        return None
+
+    inner = call.parameters[0]
+    if not _references_only_variable(inner, target_alias):
+        return None
+
+    if negated:
+        return QueryExpressionFunction(
+            function=Function.NOT,
+            parameters=[inner],
+            data_type=bool,
+        )
+    return inner
+
+
 def extract_barrier_filter(
     where_expr: QueryExpression | None,
     target_alias: str,
 ) -> tuple[QueryExpression | None, QueryExpression | None]:
     """Extract is_terminator() directive from WHERE clause.
 
-    Finds `is_terminator(<predicate>)` in the AND-flattened WHERE conjuncts,
-    extracts the inner predicate, and returns it separately.
+    Finds `is_terminator(<predicate>)` — or its negated form
+    `NOT is_terminator(<predicate>)` — in the AND-flattened WHERE
+    conjuncts, extracts the barrier predicate, and returns it separately.
+    For the negated form the barrier predicate is `NOT(<predicate>)`:
+    the barrier fires where the inner predicate is false.
 
     The inner predicate MUST reference only `target_alias`.
 
@@ -522,15 +573,13 @@ def extract_barrier_filter(
     if not where_expr:
         return None, None
 
-    # Single is_terminator() call (no AND wrapper)
-    if (
-        isinstance(where_expr, QueryExpressionFunction)
-        and where_expr.function == Function.IS_TERMINATOR
-        and len(where_expr.parameters) == 1
-    ):
-        inner = where_expr.parameters[0]
-        if _references_only_variable(inner, target_alias):
-            return inner, None
+    # Single (possibly NOT-wrapped) is_terminator() call, no AND wrapper
+    single_pred = _match_terminator_conjunct(where_expr, target_alias)
+    if single_pred is not None:
+        return single_pred, None
+    if _is_terminator_call(where_expr):
+        # is_terminator referencing the wrong variable: leave in WHERE so
+        # the caller's validation raises a descriptive error.
         return None, where_expr
 
     # Flatten AND tree and search conjuncts
@@ -542,14 +591,13 @@ def extract_barrier_filter(
     remaining_parts: list[QueryExpression] = []
 
     for conjunct in conjuncts:
-        if (
-            barrier_pred is None
-            and isinstance(conjunct, QueryExpressionFunction)
-            and conjunct.function == Function.IS_TERMINATOR
-            and len(conjunct.parameters) == 1
-            and _references_only_variable(conjunct.parameters[0], target_alias)
-        ):
-            barrier_pred = conjunct.parameters[0]
+        matched = (
+            _match_terminator_conjunct(conjunct, target_alias)
+            if barrier_pred is None
+            else None
+        )
+        if matched is not None:
+            barrier_pred = matched
         else:
             remaining_parts.append(conjunct)
 

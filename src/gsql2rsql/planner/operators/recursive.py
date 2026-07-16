@@ -127,6 +127,8 @@ class RecursiveTraversalOperator(LogicalOperator):
         edge_properties: list[str] | None = None,
         edge_filter: QueryExpression | None = None,
         edge_filter_lambda_var: str = "",
+        node_filter: QueryExpression | None = None,
+        node_filter_lambda_var: str = "",
         direction: RelationshipDirection = RelationshipDirection.FORWARD,
         use_internal_union_for_bidirectional: bool = False,
         swap_source_sink: bool = False,
@@ -163,6 +165,14 @@ class RecursiveTraversalOperator(LogicalOperator):
         # See class docstring for detailed explanation of this optimization
         self.edge_filter = edge_filter
         self.edge_filter_lambda_var = edge_filter_lambda_var
+
+        # Node predicate pushdown: from ALL(n IN nodes(path) WHERE pred)
+        # with pred referencing only the lambda variable. The renderer may
+        # traverse a pre-filtered edge set (both endpoints satisfy pred).
+        # OPTIMIZATION ONLY: the originating ALL always stays in the WHERE
+        # clause as a residual, so skipping this pushdown is never wrong.
+        self.node_filter = node_filter
+        self.node_filter_lambda_var = node_filter_lambda_var
 
         # Direction for undirected traversal support
         # FORWARD: (a)-[:TYPE*]->(b) - follow edges in their direction

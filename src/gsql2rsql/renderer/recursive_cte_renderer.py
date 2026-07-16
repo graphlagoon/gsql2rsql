@@ -165,8 +165,16 @@ class RecursiveCTERenderer:
         # Resolve filter clauses (edge predicate pushdown + source node filter)
         self._resolve_filter_clauses(op, ei)
 
+        # Node predicate pushdown: traverse a pre-filtered edge set.
+        # OPTIMIZATION ONLY — the originating ALL(n IN nodes(p) ...) stays
+        # in the final WHERE as a residual subquery, so disabling this
+        # (enable_vlp_node_pushdown=False) never changes results.
+        filtered_edges_cte = self._build_filtered_edges_cte(op, ei)
+
         # Assemble CTE
         lines: list[str] = []
+        if filtered_edges_cte:
+            lines.append(filtered_edges_cte)
         lines.append(f"  {ei.cte_name} AS (")
 
         # Zero-length path base case (min_depth == 0)
@@ -275,6 +283,76 @@ class RecursiveCTERenderer:
                 ei.barrier_node_table = td.full_table_name
                 ei.barrier_node_id_col = enriched_rec.target_node.id_column
                 ei.barrier_node_type_filter = td.filter
+
+    def _build_filtered_edges_cte(
+        self, op: RecursiveTraversalOperator, ei: EdgeInfo
+    ) -> str | None:
+        """Build the pre-filtered edge CTE for node predicate pushdown.
+
+        For ``ALL(n IN nodes(p) WHERE pred)`` in a conjunctive position,
+        every path node must satisfy ``pred``, and path nodes are exactly
+        the endpoints of traversed edges — so traversal can read from a
+        derived edge set whose endpoints both satisfy the predicate::
+
+            vlp_filtered_edges_N AS (
+              SELECT e.* FROM <edges> e
+              JOIN (SELECT DISTINCT <id> FROM <nodes> WHERE pred) _ns
+                ON _ns.<id> = e.<src>
+              JOIN (SELECT DISTINCT <id> FROM <nodes> WHERE pred) _nt
+                ON _nt.<id> = e.<dst>
+            ),
+
+        Semi-join via DISTINCT derived tables (no row fan-out). Redirects
+        ``ei.single_table_name`` to the new CTE; the edge type filter
+        (``ei.single_table_filter``) stays applied inside the base and
+        recursive cases as before. The zero-length (depth-0) branch reads
+        the node table directly and is intentionally NOT touched — the
+        residual WHERE subquery keeps it correct.
+
+        Returns None (no pushdown) unless enrichment marked the operator
+        eligible AND the ``enable_vlp_node_pushdown`` config (default True)
+        allows it.
+        """
+        if not self._ctx.config.get("enable_vlp_node_pushdown", True):
+            return None
+        enriched_rec = self._get_enriched_recursive(op)
+        if (
+            not enriched_rec
+            or enriched_rec.node_filter_as_nf is None
+            or enriched_rec.node_pushdown_node is None
+            or not ei.single_table
+            or not ei.single_table_name
+        ):
+            return None
+
+        pred_sql = self._expr.render_edge_filter_expression(
+            enriched_rec.node_filter_as_nf
+        )
+        node_info = enriched_rec.node_pushdown_node
+        node_table = node_info.table_descriptor.full_table_name
+        id_col = node_info.id_column
+        passing_nodes = (
+            f"SELECT DISTINCT nf.{id_col} FROM {node_table} nf "
+            f"WHERE {pred_sql}"
+        )
+
+        filtered_name = f"vlp_filtered_edges_{self._ctx.cte_counter}"
+        lines = [
+            f"  {filtered_name} AS (",
+            "    -- Node predicate pushdown: keep only edges whose BOTH",
+            "    -- endpoints satisfy ALL(n IN nodes(p) WHERE ...)",
+            "    SELECT e.*",
+            f"    FROM {ei.single_table_name} e",
+            f"    JOIN ({passing_nodes}) _ns",
+            f"      ON _ns.{id_col} = e.{ei.source_id_col}",
+            f"    JOIN ({passing_nodes}) _nt",
+            f"      ON _nt.{id_col} = e.{ei.target_id_col}",
+            "  ),",
+        ]
+
+        # Redirect all edge reads in this CTE to the filtered set.
+        ei.single_table_name = filtered_name
+        return "\n".join(lines)
 
     def _build_edge_struct(self, ei: EdgeInfo, alias: str = "e") -> str:
         """Build NAMED_STRUCT expression for an edge with its properties."""

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from gsql2rsql.common.exceptions import (
     TranspilerInternalErrorException,
+    TranspilerNotSupportedException,
 )
 from gsql2rsql.parser.ast import (
     NodeEntity,
@@ -53,6 +54,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from gsql2rsql.renderer.render_context import RenderContext
+    from gsql2rsql.renderer.sql_enrichment import EnrichedNodesListPredicate
 
 
 class ExpressionRenderer:
@@ -671,6 +673,20 @@ class ExpressionRenderer:
         var_name = expr.variable_name
         list_sql = self.render_expression(expr.list_expression, context_op)
 
+        # nodes(path) with property access: the path array holds scalar node
+        # IDs, so a HOF lambda (FORALL(path, n -> n.prop)) is a Spark type
+        # error. Enrichment pre-resolves the node table for these; render a
+        # correlated subquery against it instead.
+        enriched_np = (
+            self._ctx.enriched.nodes_predicates.get(id(expr))
+            if self._ctx.enriched
+            else None
+        )
+        if enriched_np is not None:
+            return self._render_nodes_predicate_subquery(
+                expr, enriched_np, list_sql, context_op
+            )
+
         # Check for simple equality optimization: ANY(x IN list WHERE x = value)
         equality_value = self._extract_equality_value(
             expr.filter_expression, var_name, context_op
@@ -711,6 +727,84 @@ class ExpressionRenderer:
             return f"SIZE(FILTER({list_sql}, {var_name} -> {filter_sql})) = 1"
         else:
             return f"EXISTS({list_sql}, {var_name} -> {filter_sql})"
+
+    def _render_nodes_predicate_subquery(
+        self,
+        expr: QueryExpressionListPredicate,
+        enriched_np: EnrichedNodesListPredicate,
+        list_sql: str,
+        context_op: LogicalOperator,
+    ) -> str:
+        """Render ALL/ANY/NONE/SINGLE over nodes(path) with property access.
+
+        The path array contains scalar node IDs; node properties live in the
+        node table. Emits a subquery correlated only through
+        ``ARRAY_CONTAINS(<path column>, <alias>.<id>)``, using the Cypher
+        lambda variable as the table alias so the lambda body renders
+        unchanged (``n.status`` -> ``n.status``).
+
+        Cypher WHERE semantics (rows survive only on TRUE):
+        - all():    no path node may FAIL or NULL-evaluate the predicate
+        - any():    at least one node must satisfy it (TRUE)
+        - none():   no node may satisfy it, and none may NULL-evaluate it
+        - single(): exactly one node satisfies it (NULL elements approximate
+          to non-matching; path nodes are distinct thanks to the traversal's
+          visited check, so COUNT over the id-join is exact)
+
+        In a projection context (RETURN all(...)), cases where Cypher yields
+        NULL are returned as FALSE/TRUE by these forms — acceptable for
+        boolean filtering, documented deviation for projection.
+        """
+        if self._ctx.vlp_rendering_mode == "procedural":
+            # The procedural BFS final view emits CAST(NULL AS ARRAY) for the
+            # path column (paths are never collected), so ARRAY_CONTAINS
+            # would be vacuously NULL and the filter silently dropped.
+            raise TranspilerNotSupportedException(
+                "List predicates over nodes(<path>) that access node "
+                "properties (e.g. all(n IN nodes(p) WHERE n.prop = ...)) "
+                "are not supported with vlp_rendering_mode='procedural'. "
+                "Use the default CTE rendering mode for this query."
+            )
+
+        var = expr.variable_name
+        tbl = enriched_np.node_table_name
+        id_col = enriched_np.node_id_column
+        member = f"ARRAY_CONTAINS({list_sql}, {var}.{id_col})"
+        base_parts = [member]
+        if enriched_np.node_type_filter:
+            base_parts.insert(0, f"{var}.{enriched_np.node_type_filter}")
+        base = " AND ".join(base_parts)
+
+        if expr.filter_expression is not None:
+            pred = self._render_list_predicate_filter(
+                expr.filter_expression, var, context_op
+            )
+        else:
+            pred = f"{var}.{id_col} IS NOT NULL"
+
+        ptype = expr.predicate_type
+        if ptype == ListPredicateType.ALL:
+            violation = f"(NOT ({pred}) OR ({pred}) IS NULL)"
+            return (
+                f"NOT EXISTS (SELECT 1 FROM {tbl} {var} "
+                f"WHERE {base} AND {violation})"
+            )
+        elif ptype == ListPredicateType.ANY:
+            return (
+                f"EXISTS (SELECT 1 FROM {tbl} {var} "
+                f"WHERE {base} AND ({pred}))"
+            )
+        elif ptype == ListPredicateType.NONE:
+            match_or_null = f"(({pred}) OR ({pred}) IS NULL)"
+            return (
+                f"NOT EXISTS (SELECT 1 FROM {tbl} {var} "
+                f"WHERE {base} AND {match_or_null})"
+            )
+        else:  # SINGLE
+            return (
+                f"(SELECT COUNT(*) FROM {tbl} {var} "
+                f"WHERE {base} AND ({pred})) = 1"
+            )
 
     def _extract_equality_value(
         self,

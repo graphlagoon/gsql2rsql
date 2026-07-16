@@ -559,3 +559,111 @@ class TestTempTablesDetailedAnalysis:
             assert "NOT EXISTS" not in result_sql, (
                 "Result must include edges TO barrier nodes"
             )
+
+
+# ===================================================================
+# Tests: NOT is_terminator(P) — negated barrier directive
+# ===================================================================
+
+NOT_BARRIER_QUERY = """
+MATCH path = (a:Station)-[:LINK*1..5]->(b:Station)
+WHERE a.node_id = 'N1'
+  AND NOT is_terminator(b.is_hub = true)
+RETURN DISTINCT b.node_id AS dst
+"""
+
+# User-reported shape (case 2): OR + coalesce inside NOT is_terminator
+NOT_BARRIER_OR_COALESCE_QUERY = """
+MATCH path = (a:Station)-[:LINK*1..5]->(b:Station)
+WHERE a.node_id = 'N1'
+  AND NOT is_terminator(
+    b.is_hub = true OR coalesce(b.node_id, 'X') <> 'X'
+  )
+RETURN DISTINCT b.node_id AS dst
+"""
+
+
+class TestNotIsTerminatorSQLStructure:
+    """NOT is_terminator(P) == is_terminator(NOT P): barrier fires
+    where P is false. Must work in both VLP renderers."""
+
+    schema = _make_schema()
+
+    def test_numbered_views_negated_predicate(self) -> None:
+        sql = _transpile(
+            NOT_BARRIER_QUERY,
+            self.schema,
+            materialization="numbered_views",
+        )
+        lines = _barrier_not_exists_lines(sql)
+        assert lines, "barrier NOT EXISTS must be emitted"
+        assert any("NOT ((barrier.is_hub) = (TRUE))" in ln for ln in lines), (
+            f"barrier predicate must be negated, got: {lines}"
+        )
+
+    def test_temp_tables_negated_precompute(self) -> None:
+        sql = _transpile(
+            NOT_BARRIER_QUERY,
+            self.schema,
+            materialization="temp_tables",
+        )
+        # O10 precomputes the barrier set; predicate must be negated there
+        match = re.search(
+            r"CREATE TEMPORARY TABLE bfs_barrier_\d+ AS.*?;",
+            sql,
+            re.DOTALL,
+        )
+        assert match, "barrier precompute table must exist"
+        assert "NOT ((barrier.is_hub) = (TRUE))" in match.group(0), (
+            f"precomputed barrier must use negated predicate:\n{match.group(0)}"
+        )
+
+    def test_recursive_cte_negated_predicate(self) -> None:
+        sql = _transpile(
+            NOT_BARRIER_QUERY,
+            self.schema,
+            materialization="cte",
+            vlp_mode="recursive_cte",
+        )
+        lines = _barrier_not_exists_lines(sql)
+        assert lines, "barrier NOT EXISTS must be emitted in recursive CTE"
+        assert any("NOT ((barrier.is_hub) = (TRUE))" in ln for ln in lines), (
+            f"barrier predicate must be negated, got: {lines}"
+        )
+
+    def test_or_coalesce_inside_not_terminator(self) -> None:
+        """User case 2 shape: NOT is_terminator(P1 OR coalesce(...) <> ...)."""
+        for vlp_mode, mat in [
+            ("procedural", "numbered_views"),
+            ("recursive_cte", "cte"),
+        ]:
+            sql = _transpile(
+                NOT_BARRIER_OR_COALESCE_QUERY,
+                self.schema,
+                materialization=mat,
+                vlp_mode=vlp_mode,
+            )
+            lines = _barrier_not_exists_lines(sql)
+            assert lines, f"[{vlp_mode}/{mat}] barrier NOT EXISTS missing"
+            joined = "\n".join(lines)
+            assert "NOT (" in joined and "COALESCE" in joined.upper(), (
+                f"[{vlp_mode}/{mat}] negated OR/coalesce predicate missing:"
+                f"\n{joined}"
+            )
+
+    def test_not_terminator_wrong_alias_still_raises(self) -> None:
+        """NOT is_terminator(a.x) referencing the source alias must
+        still raise the descriptive validation error."""
+        from gsql2rsql.common.exceptions import (
+            TranspilerNotSupportedException,
+        )
+        bad = """
+        MATCH path = (a:Station)-[:LINK*1..5]->(b:Station)
+        WHERE NOT is_terminator(a.node_id = 'N1')
+        RETURN DISTINCT b.node_id AS dst
+        """
+        with pytest.raises(
+            TranspilerNotSupportedException,
+            match="target node",
+        ):
+            _transpile(bad, self.schema, materialization="numbered_views")
