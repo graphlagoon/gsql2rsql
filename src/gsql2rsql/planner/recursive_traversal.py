@@ -168,11 +168,19 @@ def create_recursive_match_tree(
     #
     # This analysis examines both WHERE clause and RETURN expressions.
     # =====================================================================
+    # The user-declared relationship variable ([arestas*1..3]) IS the list
+    # of traversed relationships — ALL(r IN arestas ...) is equivalent to
+    # ALL(r IN relationships(path) ...). Pass it so the analyzer treats
+    # direct references to it as relationships(path).
+    rel_variable = (
+        rel.alias if rel.alias and not rel.alias.startswith("_anon") else ""
+    )
     path_analyzer = PathExpressionAnalyzer()
     path_info = path_analyzer.analyze(
         path_variable=match_clause.path_variable,
         where_expr=match_clause.where_expression,
         return_exprs=return_exprs,
+        relationship_variable=rel_variable,
     )
 
     # Log analysis result for debugging
@@ -305,6 +313,7 @@ def create_recursive_match_tree(
         # Node predicate pushdown (optimization only; residual kept in WHERE)
         node_filter=path_info.combined_node_predicate,
         node_filter_lambda_var=path_info.node_lambda_variable,
+        node_filter_source_exprs=path_info.node_pushed_source_exprs,
         # Direction for undirected traversal support
         direction=rel.direction,
         # Planner decision: use internal UNION for bidirectional traversal

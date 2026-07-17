@@ -463,6 +463,32 @@ class ExpressionRenderer:
             return render_from_template(tmpl, params)
 
         # --- Complex handlers requiring AST inspection ---
+        if func == Function.LIST_INDEX:
+            # Cypher list[i]: 0-based, negative counts from the end,
+            # out-of-range -> NULL. GET() is 0-based and NULL-safe.
+            arr, idx = params[0], params[1]
+            return (
+                f"GET({arr}, CASE WHEN ({idx}) < 0 "
+                f"THEN SIZE({arr}) + ({idx}) ELSE ({idx}) END)"
+            )
+        elif func == Function.LIST_SLICE:
+            # Cypher list[a..b]: 0-based, end-exclusive, negatives from
+            # the end, bounds clamped, omitted bound = open end (the
+            # visitor passes NULL literals for omitted bounds).
+            return self._render_list_slice(params[0], params[1], params[2])
+
+        if func == Function.TYPE:
+            # type(r) is resolved to r.<type column> by enrichment ONLY in
+            # the pushed-down VLP edge lambda. Anywhere else (RETURN type(r),
+            # single-hop WHERE) reaching the renderer means it was never
+            # rewritten — fail clearly instead of with an internal error.
+            raise TranspilerNotSupportedException(
+                "type(<rel>) is currently supported only inside a "
+                "variable-length ALL(r IN relationships(p) WHERE ...) "
+                "predicate. Elsewhere, reference the relationship-type "
+                "column directly (e.g. r.relationship_type = 'KNOWS')."
+            )
+
         if func == Function.NODES:
             # nodes(path) → pass-through path column
             return params[0] if params else "ARRAY()"
@@ -728,6 +754,64 @@ class ExpressionRenderer:
         else:
             return f"EXISTS({list_sql}, {var_name} -> {filter_sql})"
 
+    def _render_list_slice(self, arr: str, start: str, end: str) -> str:
+        """Render Cypher ``list[a..b]`` as a Spark SLICE call.
+
+        Cypher slice: 0-based, end-exclusive, negative bounds count from
+        the end, out-of-range bounds clamp, omitted bounds (rendered as
+        the literal NULL by the visitor) mean open start/end.
+
+        General form:
+            SLICE(arr, norm(start)+1, GREATEST(0, norm(end)-norm(start)))
+
+        Common literal bounds are simplified so the dominant patterns
+        (``[0..-1]``, ``[1..]``) stay readable.
+        """
+        def _literal_int(sql: str) -> int | None:
+            # Bounds render through the value renderer, so a negative
+            # literal arrives as a unary-minus string like "-(1)". Strip
+            # surrounding whitespace/parens and a leading '-' so the
+            # readable negative-literal branch below is actually reached.
+            text = sql.strip()
+            try:
+                return int(text.strip("() "))
+            except ValueError:
+                pass
+            compact = text.replace(" ", "")
+            if compact.startswith("-"):
+                try:
+                    return -int(compact[1:].strip("()"))
+                except ValueError:
+                    return None
+            return None
+
+        def _norm(bound: str, default_sql: str) -> str:
+            if bound.strip().upper() == "NULL":
+                return default_sql
+            lit = _literal_int(bound)
+            if lit is not None:
+                if lit == 0:
+                    return "0"
+                if lit > 0:
+                    return f"LEAST({lit}, SIZE({arr}))"
+                return f"GREATEST(0, SIZE({arr}) - {-lit})"
+            return (
+                f"CASE WHEN ({bound}) < 0 "
+                f"THEN GREATEST(0, SIZE({arr}) + ({bound})) "
+                f"ELSE LEAST(({bound}), SIZE({arr})) END"
+            )
+
+        norm_start = _norm(start, "0")
+        norm_end = _norm(end, f"SIZE({arr})")
+
+        if norm_start == "0":
+            length = norm_end
+            return f"SLICE({arr}, 1, {length})"
+        return (
+            f"SLICE({arr}, ({norm_start}) + 1, "
+            f"GREATEST(0, ({norm_end}) - ({norm_start})))"
+        )
+
     def _render_nodes_predicate_subquery(
         self,
         expr: QueryExpressionListPredicate,
@@ -759,11 +843,32 @@ class ExpressionRenderer:
             # The procedural BFS final view emits CAST(NULL AS ARRAY) for the
             # path column (paths are never collected), so ARRAY_CONTAINS
             # would be vacuously NULL and the filter silently dropped.
+            # The ONLY supported form is a conjunctive ALL whose predicate
+            # was extracted into the traversal's node_filter: the procedural
+            # renderer then enforces it via its frontier filter (every
+            # frontier/seed node must pass), making the residual here
+            # trivially TRUE. Both sides consult the same eligibility rule
+            # (vlp_node_pushdown_active) so neither can silently diverge.
+            from gsql2rsql.renderer.sql_enrichment import (
+                vlp_node_pushdown_active,
+            )
+
+            op_id = enriched_np.enforced_by_traversal_op_id
+            enriched_rec = (
+                self._ctx.enriched.recursive_ops.get(op_id)
+                if self._ctx.enriched and op_id is not None
+                else None
+            )
+            if vlp_node_pushdown_active(enriched_rec, self._ctx.config):
+                return "TRUE /* enforced by VLP node pushdown */"
             raise TranspilerNotSupportedException(
                 "List predicates over nodes(<path>) that access node "
-                "properties (e.g. all(n IN nodes(p) WHERE n.prop = ...)) "
-                "are not supported with vlp_rendering_mode='procedural'. "
-                "Use the default CTE rendering mode for this query."
+                "properties are only supported with "
+                "vlp_rendering_mode='procedural' when they are a "
+                "conjunctive all(...) whose predicate references only the "
+                "lambda variable (enforced via the BFS frontier filter). "
+                "This predicate cannot be enforced that way — use the "
+                "default CTE rendering mode for this query."
             )
 
         var = expr.variable_name
@@ -864,6 +969,34 @@ class ExpressionRenderer:
         should be rendered as just 'x' (the lambda parameter), not as a
         field lookup in the context operator's schema.
         """
+        if isinstance(expr, QueryExpressionExists):
+            # Pattern predicates like size((n)--()) or exists((n)--())
+            # inside a lambda would need a per-element correlated pattern
+            # count — not supported. The alternative is a materialized
+            # degree/count column on the node table.
+            raise TranspilerNotSupportedException(
+                "Graph pattern predicates (e.g. size((n)--()), "
+                "exists((n)--())) are not supported inside list-predicate "
+                "lambdas such as all(n IN nodes(p) WHERE ...). "
+                "Materialize the count as a node property (e.g. a "
+                "'degree' column) and filter on it instead: "
+                "all(n IN nodes(p) WHERE n.degree <= 15)."
+            )
+        if isinstance(expr, QueryExpressionFunction) and (
+            expr.function == Function.TYPE
+        ):
+            # type(r) is rewritten to r.<type column> by enrichment when
+            # the edge schema declares one. Reaching here means either the
+            # schema has no type column or type() was used outside a
+            # pushed-down edge lambda.
+            raise TranspilerNotSupportedException(
+                "type(<var>) could not be resolved to a relationship-type "
+                "column here. Either the edge schema declares no type "
+                "column, or type() was used in a position that is not a "
+                "conjunctive all(r IN relationships(p) WHERE ...). "
+                "Reference the type column directly instead (e.g. "
+                "r.relationship_type = 'FILIAL_DE')."
+            )
         if isinstance(expr, QueryExpressionProperty):
             # If it's just the variable (no property), return it as-is
             if expr.variable_name == var_name and not expr.property_name:

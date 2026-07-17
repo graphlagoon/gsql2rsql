@@ -78,6 +78,11 @@ class EdgeSchema(EntitySchema):
     sink_node_id: str = ""
     source_id_property: EntityProperty | None = None
     sink_id_property: EntityProperty | None = None
+    # Column holding the relationship type name, when the storage model
+    # keeps multiple edge types in one table. Enables Cypher type(r).
+    # None when unknown — type(r) then fails with a clear error instead
+    # of guessing.
+    type_property: EntityProperty | None = None
 
     @property
     def id(self) -> str:

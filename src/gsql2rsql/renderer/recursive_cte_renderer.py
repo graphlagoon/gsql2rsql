@@ -21,6 +21,8 @@ from gsql2rsql.planner.operators import (
 
 from typing import TYPE_CHECKING
 
+from gsql2rsql.renderer.sql_enrichment import vlp_node_pushdown_active
+
 if TYPE_CHECKING:
     from gsql2rsql.renderer.expression_renderer import ExpressionRenderer
     from gsql2rsql.renderer.render_context import RenderContext
@@ -256,10 +258,17 @@ class RecursiveCTERenderer:
         if not enriched_rec:
             return
 
-        # Edge predicate pushdown
+        # Edge predicate pushdown. Wrapped in parentheses: the predicate
+        # may be an OR chain (type(r) = 'X' OR r.pct >= 50) and is later
+        # AND-joined with depth/visited guards — without the wrap the OR
+        # would swallow those guards (unbounded recursion).
         if enriched_rec.edge_filter_as_e:
-            ei.edge_filter_sql = self._expr.render_edge_filter_expression(
-                enriched_rec.edge_filter_as_e
+            ei.edge_filter_sql = (
+                "("
+                + self._expr.render_edge_filter_expression(
+                    enriched_rec.edge_filter_as_e
+                )
+                + ")"
             )
 
         # Source node filter pushdown
@@ -313,17 +322,19 @@ class RecursiveCTERenderer:
         eligible AND the ``enable_vlp_node_pushdown`` config (default True)
         allows it.
         """
-        if not self._ctx.config.get("enable_vlp_node_pushdown", True):
-            return None
         enriched_rec = self._get_enriched_recursive(op)
-        if (
-            not enriched_rec
-            or enriched_rec.node_filter_as_nf is None
-            or enriched_rec.node_pushdown_node is None
-            or not ei.single_table
-            or not ei.single_table_name
-        ):
+        # Shared eligibility rule (config + enriched fields) lives in
+        # sql_enrichment so both renderers and the expression renderer
+        # agree. The single_table condition is CTE-specific (the filtered
+        # edges CTE only redirects a single edge table) and stays here.
+        if not vlp_node_pushdown_active(enriched_rec, self._ctx.config):
             return None
+        if not ei.single_table or not ei.single_table_name:
+            return None
+        # Guaranteed non-None by vlp_node_pushdown_active (checks all).
+        assert enriched_rec is not None
+        assert enriched_rec.node_filter_as_nf is not None
+        assert enriched_rec.node_pushdown_node is not None
 
         pred_sql = self._expr.render_edge_filter_expression(
             enriched_rec.node_filter_as_nf

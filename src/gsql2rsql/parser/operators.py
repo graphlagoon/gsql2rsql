@@ -191,6 +191,11 @@ class Function(Enum):
     RELATIONSHIPS = auto()  # relationships(path) -> returns array of edge structs
     LENGTH = auto()  # length(path) -> number of relationships (edges) in path
     IS_TERMINATOR = auto()  # is_terminator(predicate) — traversal barrier directive
+    TYPE = auto()  # type(r) -> relationship type name
+
+    # List access (built by the visitor from '[' ... ']', not by name)
+    LIST_INDEX = auto()  # list[i] -> params: (list, index)
+    LIST_SLICE = auto()  # list[a..b] -> params: (list, start|None, end|None)
 
     # Math functions
     ABS = auto()
@@ -280,6 +285,7 @@ FUNCTIONS: dict[str, FunctionInfo] = {
     "rels": FunctionInfo(Function.RELATIONSHIPS, 1),  # alias for relationships
     # Traversal barrier directive
     "is_terminator": FunctionInfo(Function.IS_TERMINATOR, 1),
+    "type": FunctionInfo(Function.TYPE, 1),
     # Math functions
     "abs": FunctionInfo(Function.ABS, 1),
     "ceil": FunctionInfo(Function.CEIL, 1),

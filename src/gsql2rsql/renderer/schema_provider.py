@@ -372,6 +372,7 @@ class SimpleSQLSchemaProvider(ISQLDBSchemaProvider):
                 sink_node_id=WILDCARD_NODE_TYPE,
                 source_id_property=self._base_edge_schema.source_id_property,
                 sink_id_property=self._base_edge_schema.sink_id_property,
+                type_property=self._base_edge_schema.type_property,
                 properties=self._base_edge_schema.properties,
             )
         return None

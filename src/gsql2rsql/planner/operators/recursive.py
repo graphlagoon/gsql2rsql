@@ -129,6 +129,7 @@ class RecursiveTraversalOperator(LogicalOperator):
         edge_filter_lambda_var: str = "",
         node_filter: QueryExpression | None = None,
         node_filter_lambda_var: str = "",
+        node_filter_source_exprs: list[QueryExpression] | None = None,
         direction: RelationshipDirection = RelationshipDirection.FORWARD,
         use_internal_union_for_bidirectional: bool = False,
         swap_source_sink: bool = False,
@@ -171,8 +172,14 @@ class RecursiveTraversalOperator(LogicalOperator):
         # traverse a pre-filtered edge set (both endpoints satisfy pred).
         # OPTIMIZATION ONLY: the originating ALL always stays in the WHERE
         # clause as a residual, so skipping this pushdown is never wrong.
+        # node_filter_source_exprs holds the originating ALL expressions —
+        # the procedural BFS renderer (which cannot evaluate the residual:
+        # it never collects the path array) enforces the predicate in its
+        # frontier filter instead, and uses these identities to render the
+        # residual as TRUE.
         self.node_filter = node_filter
         self.node_filter_lambda_var = node_filter_lambda_var
+        self.node_filter_source_exprs = node_filter_source_exprs or []
 
         # Direction for undirected traversal support
         # FORWARD: (a)-[:TYPE*]->(b) - follow edges in their direction

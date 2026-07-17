@@ -14,6 +14,7 @@ import pytest
 
 from gsql2rsql.parser.ast import (
     ListPredicateType,
+    QueryExpression,
     QueryExpressionBinary,
     QueryExpressionFunction,
     QueryExpressionListPredicate,
@@ -28,10 +29,12 @@ from gsql2rsql.parser.operators import (
     BinaryOperatorType,
     Function,
 )
+from gsql2rsql.parser.ast import QueryExpressionExists
 from gsql2rsql.planner.path_analyzer import (
     PathExpressionAnalyzer,
     PathUsageInfo,
     rewrite_predicate_for_edge_alias,
+    rewrite_type_calls_to_property,
 )
 
 
@@ -750,3 +753,211 @@ class TestPathUsageInfo:
         """No predicates returns None."""
         info = PathUsageInfo(path_variable="path")
         assert info.combined_edge_predicate is None
+
+
+class TestRelationshipVariableEquivalence:
+    """ALL(r IN <relvar> ...) where relvar is the VLP relationship
+    variable is equivalent to ALL(r IN relationships(path) ...)."""
+
+    @staticmethod
+    def _analyzer() -> PathExpressionAnalyzer:
+        return PathExpressionAnalyzer()
+
+    @staticmethod
+    def _all_over(list_var: str, lambda_var: str) -> QueryExpressionListPredicate:
+        pred = QueryExpressionBinary(
+            left_expression=QueryExpressionProperty(
+                variable_name=lambda_var, property_name="pct"
+            ),
+            right_expression=QueryExpressionValue(value=50, value_type=int),
+            operator=BinaryOperatorInfo(
+                name=BinaryOperator.GEQ,
+                operator_type=BinaryOperatorType.COMPARISON,
+            ),
+        )
+        return QueryExpressionListPredicate(
+            predicate_type=ListPredicateType.ALL,
+            variable_name=lambda_var,
+            list_expression=QueryExpressionProperty(
+                variable_name=list_var, property_name=""
+            ),
+            filter_expression=pred,
+        )
+
+    def test_relvar_treated_as_relationships_of_path(self) -> None:
+        info = self._analyzer().analyze(
+            path_variable="path",
+            where_expr=self._all_over("arestas", "r"),
+            return_exprs=None,
+            relationship_variable="arestas",
+        )
+        assert info.needs_edge_collection is True
+        assert len(info.edge_predicates) == 1
+        assert len(info.pushed_all_expressions) == 1
+
+    def test_unknown_variable_not_treated_as_relationships(self) -> None:
+        info = self._analyzer().analyze(
+            path_variable="path",
+            where_expr=self._all_over("something_else", "r"),
+            return_exprs=None,
+            relationship_variable="arestas",
+        )
+        # A bare list variable that is NOT the declared relvar is not the
+        # relationship list — no edge collection, no pushdown.
+        assert info.needs_edge_collection is False
+        assert len(info.edge_predicates) == 0
+
+
+class TestNodePredicatePushdownEligibility:
+    """Node-predicate extraction (ALL over nodes(path)) into
+    node_predicates / node_pushed_source_exprs."""
+
+    @staticmethod
+    def _nodes_all(
+        filter_expr: QueryExpression, lambda_var: str = "n"
+    ) -> QueryExpressionListPredicate:
+        return QueryExpressionListPredicate(
+            predicate_type=ListPredicateType.ALL,
+            variable_name=lambda_var,
+            list_expression=QueryExpressionFunction(
+                function=Function.NODES,
+                parameters=[
+                    QueryExpressionProperty(
+                        variable_name="path", property_name=""
+                    )
+                ],
+            ),
+            filter_expression=filter_expr,
+        )
+
+    def test_lambda_only_predicate_extracted(self) -> None:
+        # all(n IN nodes(path) WHERE n.grau <= 15) -> pushable
+        pred = QueryExpressionBinary(
+            left_expression=QueryExpressionProperty(
+                variable_name="n", property_name="grau"
+            ),
+            right_expression=QueryExpressionValue(value=15, value_type=int),
+            operator=BinaryOperatorInfo(
+                name=BinaryOperator.LEQ,
+                operator_type=BinaryOperatorType.COMPARISON,
+            ),
+        )
+        info = PathExpressionAnalyzer().analyze(
+            path_variable="path",
+            where_expr=self._nodes_all(pred),
+            return_exprs=None,
+        )
+        assert len(info.node_predicates) == 1
+        assert info.node_lambda_variable == "n"
+        assert len(info.node_pushed_source_exprs) == 1
+
+    def test_outer_variable_predicate_not_extracted(self) -> None:
+        # all(n IN nodes(path) WHERE n.grau <= d.limit) -> not pushable
+        pred = QueryExpressionBinary(
+            left_expression=QueryExpressionProperty(
+                variable_name="n", property_name="grau"
+            ),
+            right_expression=QueryExpressionProperty(
+                variable_name="d", property_name="limit"
+            ),
+            operator=BinaryOperatorInfo(
+                name=BinaryOperator.LEQ,
+                operator_type=BinaryOperatorType.COMPARISON,
+            ),
+        )
+        info = PathExpressionAnalyzer().analyze(
+            path_variable="path",
+            where_expr=self._nodes_all(pred),
+            return_exprs=None,
+        )
+        assert len(info.node_predicates) == 0
+
+    def test_pattern_exists_predicate_not_extracted(self) -> None:
+        # all(n IN nodes(path) WHERE size((n)--()) <= 15): the pattern
+        # count parses to a QueryExpressionExists -> excluded from pushdown.
+        pred = QueryExpressionBinary(
+            left_expression=QueryExpressionFunction(
+                function=Function.SIZE,
+                parameters=[QueryExpressionExists()],
+            ),
+            right_expression=QueryExpressionValue(value=15, value_type=int),
+            operator=BinaryOperatorInfo(
+                name=BinaryOperator.LEQ,
+                operator_type=BinaryOperatorType.COMPARISON,
+            ),
+        )
+        info = PathExpressionAnalyzer().analyze(
+            path_variable="path",
+            where_expr=self._nodes_all(pred),
+            return_exprs=None,
+        )
+        assert len(info.node_predicates) == 0
+
+
+class TestRewriteTypeCallsToProperty:
+    """type(r) -> r.<type column> AST rewriting."""
+
+    def test_type_call_becomes_property(self) -> None:
+        expr = QueryExpressionFunction(
+            function=Function.TYPE,
+            parameters=[
+                QueryExpressionProperty(variable_name="r", property_name="")
+            ],
+        )
+        out = rewrite_type_calls_to_property(expr, "r", "rt")
+        assert isinstance(out, QueryExpressionProperty)
+        assert out.variable_name == "r"
+        assert out.property_name == "rt"
+
+    def test_type_inside_binary_or(self) -> None:
+        # type(r) = 'A' OR r.pct >= 50
+        expr = QueryExpressionBinary(
+            left_expression=QueryExpressionBinary(
+                left_expression=QueryExpressionFunction(
+                    function=Function.TYPE,
+                    parameters=[
+                        QueryExpressionProperty(
+                            variable_name="r", property_name=""
+                        )
+                    ],
+                ),
+                right_expression=QueryExpressionValue(
+                    value="A", value_type=str
+                ),
+                operator=BinaryOperatorInfo(
+                    name=BinaryOperator.EQ,
+                    operator_type=BinaryOperatorType.COMPARISON,
+                ),
+            ),
+            right_expression=QueryExpressionBinary(
+                left_expression=QueryExpressionProperty(
+                    variable_name="r", property_name="pct"
+                ),
+                right_expression=QueryExpressionValue(value=50, value_type=int),
+                operator=BinaryOperatorInfo(
+                    name=BinaryOperator.GEQ,
+                    operator_type=BinaryOperatorType.COMPARISON,
+                ),
+            ),
+            operator=BinaryOperatorInfo(
+                name=BinaryOperator.OR,
+                operator_type=BinaryOperatorType.LOGICAL,
+            ),
+        )
+        out = rewrite_type_calls_to_property(expr, "r", "rt")
+        # left.left: type(r) -> r.rt
+        left = out.left_expression
+        assert isinstance(left.left_expression, QueryExpressionProperty)
+        assert left.left_expression.property_name == "rt"
+
+    def test_type_of_other_variable_untouched(self) -> None:
+        expr = QueryExpressionFunction(
+            function=Function.TYPE,
+            parameters=[
+                QueryExpressionProperty(variable_name="other", property_name="")
+            ],
+        )
+        out = rewrite_type_calls_to_property(expr, "r", "rt")
+        # not the lambda var -> left as a TYPE function call
+        assert isinstance(out, QueryExpressionFunction)
+        assert out.function == Function.TYPE

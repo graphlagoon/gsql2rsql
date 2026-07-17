@@ -27,6 +27,9 @@ COMPLEX_HANDLERS = {
     Function.LOCALTIME,
     Function.DURATION,
     Function.IS_TERMINATOR,  # Directive, not a SQL function
+    Function.TYPE,  # Rewritten to a type-column property by enrichment
+    Function.LIST_INDEX,  # Explicit handler (GET with index normalization)
+    Function.LIST_SLICE,  # Explicit handler (_render_list_slice)
 }
 
 

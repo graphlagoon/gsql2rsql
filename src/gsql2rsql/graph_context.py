@@ -342,6 +342,9 @@ class GraphContext:
                 sink_id_property=EntityProperty(
                     property_name=self.edge_dst_col, data_type=str
                 ),
+                type_property=EntityProperty(
+                    property_name=self.edge_type_col, data_type=str
+                ),
                 properties=edge_properties,
             )
             self._schema.add_edge(

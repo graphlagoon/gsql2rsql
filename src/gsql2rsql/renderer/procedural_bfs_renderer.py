@@ -37,6 +37,7 @@ from gsql2rsql.planner.operators import (
     LogicalOperator,
     RecursiveTraversalOperator,
 )
+from gsql2rsql.renderer.sql_enrichment import vlp_node_pushdown_active
 
 if TYPE_CHECKING:
     from gsql2rsql.renderer.expression_renderer import ExpressionRenderer
@@ -347,6 +348,15 @@ class _BFSParams:
     barrier_node_table: str | None = None
     barrier_node_id_col: str | None = None
     barrier_node_type_filter: str | None = None
+    # VLP node predicate (from conjunctive ALL(n IN nodes(p) WHERE pred)).
+    # Rendered with alias "nf". When set, every seed and frontier node is
+    # required to pass it (via bfs_vlp_nodes_ok_{n}). In this mode the
+    # filter is the SEMANTIC enforcement of the predicate — the expression
+    # renderer emits TRUE for the originating ALL — so it must never be
+    # skipped when set. Eligibility decided by vlp_node_pushdown_active.
+    vlp_node_predicate: str | None = None
+    vlp_node_table: str | None = None
+    vlp_node_id_col: str | None = None
 
 
 class ProceduralBFSRenderer:
@@ -476,11 +486,17 @@ class ProceduralBFSRenderer:
         edge_table_sql = self._build_edge_table_sql(enriched)
         edge_type_filter = self._build_edge_type_filter(enriched)
 
-        # Edge predicate filter
+        # Edge predicate filter. Parenthesized: an OR-chained predicate
+        # is later AND-joined with visited/type guards in the expansion
+        # WHERE — without the wrap the OR would bypass those guards.
         edge_predicate = None
         if enriched.edge_filter_as_e:
-            edge_predicate = self._expr.render_edge_filter_expression(
-                enriched.edge_filter_as_e
+            edge_predicate = (
+                "("
+                + self._expr.render_edge_filter_expression(
+                    enriched.edge_filter_as_e
+                )
+                + ")"
             )
 
         # Source node info
@@ -514,6 +530,20 @@ class ProceduralBFSRenderer:
                         enriched.sink_filter_as_tgt
                     )
                 )
+
+        # VLP node predicate pushdown (ALL over nodes(path))
+        vlp_node_predicate = None
+        vlp_node_table = None
+        vlp_node_id_col = None
+        if vlp_node_pushdown_active(enriched, self._ctx.config):
+            assert enriched.node_filter_as_nf is not None
+            assert enriched.node_pushdown_node is not None
+            vlp_node_predicate = self._expr.render_edge_filter_expression(
+                enriched.node_filter_as_nf
+            )
+            node_pd = enriched.node_pushdown_node
+            vlp_node_table = node_pd.table_descriptor.full_table_name
+            vlp_node_id_col = node_pd.id_column
 
         # Barrier filter (is_terminator directive)
         barrier_predicate = None
@@ -563,6 +593,9 @@ class ProceduralBFSRenderer:
             barrier_node_table=barrier_node_table,
             barrier_node_id_col=barrier_node_id_col,
             barrier_node_type_filter=barrier_node_type_filter,
+            vlp_node_predicate=vlp_node_predicate,
+            vlp_node_table=vlp_node_table,
+            vlp_node_id_col=vlp_node_id_col,
         )
 
     # ------------------------------------------------------------------
@@ -1027,8 +1060,23 @@ class ProceduralBFSRenderer:
             drop_names.append(f"bfs_adj_{p.n}")
         if self._barrier_precompute_active(p):
             drop_names.append(f"bfs_barrier_{p.n}")
+        if p.vlp_node_predicate is not None:
+            drop_names.append(f"bfs_vlp_nodes_ok_{p.n}")
         for name in drop_names:
             lines.append(f"DROP TEMPORARY TABLE IF EXISTS {name};")
+
+        # VLP node predicate: materialize the passing-node set once (same
+        # shape as the barrier precompute). Every seed and frontier node is
+        # then required to be in it — this IS the enforcement of
+        # ALL(n IN nodes(p) WHERE pred); the residual in the final WHERE
+        # is rendered as TRUE. DISTINCT: no fanout on duplicate node rows.
+        if p.vlp_node_predicate is not None:
+            lines.append(
+                f"CREATE TEMPORARY TABLE bfs_vlp_nodes_ok_{p.n} AS\n"
+                f"SELECT DISTINCT nf.{p.vlp_node_id_col} AS node\n"
+                f"FROM {p.vlp_node_table} nf\n"
+                f"WHERE {p.vlp_node_predicate};"
+            )
 
         # Barrier decision: materialized once, before the loop (O10).
         # Predicate-first + DISTINCT — exactly the per-level correlated
@@ -1055,11 +1103,22 @@ class ProceduralBFSRenderer:
         lines.append(
             f"CREATE TEMPORARY TABLE bfs_visited_{p.n} (node STRING);"
         )
-        # Frontier (current level)
+        # Frontier (current level). The VLP node predicate also constrains
+        # the seed: a start node failing ALL(n IN nodes(p) ...) can head no
+        # valid path.
+        frontier_from = f"FROM {p.node_table} n{where}"
+        if p.vlp_node_predicate is not None:
+            vlp_cond = (
+                f"n.{p.node_id_col} IN "
+                f"(SELECT node FROM bfs_vlp_nodes_ok_{p.n})"
+            )
+            frontier_from += (
+                f" AND {vlp_cond}" if where else f"\nWHERE {vlp_cond}"
+            )
         lines.append(
             f"CREATE TEMPORARY TABLE bfs_frontier_{p.n} AS\n"
             f"SELECT n.{p.node_id_col} AS node\n"
-            f"FROM {p.node_table} n{where};"
+            f"{frontier_from};"
         )
         # Seed visited from frontier
         lines.append(
@@ -1132,11 +1191,17 @@ class ProceduralBFSRenderer:
                 ", e._next_is_barrier"
                 if self._barrier_on_adjacency_active(p) else ""
             )
+            adj_where = visited
+            if p.vlp_node_predicate is not None:
+                adj_where += (
+                    f"\n  AND e._next IN "
+                    f"(SELECT node FROM bfs_vlp_nodes_ok_{p.n})"
+                )
             return (
                 f"SELECT {select_cols}, e._next AS _next_node{barrier_col}\n"
                 f"FROM bfs_adj_{p.n} e\n"
                 f"INNER JOIN bfs_frontier_{p.n} f ON e._jk = f.node\n"
-                f"WHERE {visited}"
+                f"WHERE {adj_where}"
             )
 
         branches = self._direction_branches(
@@ -1167,6 +1232,11 @@ class ProceduralBFSRenderer:
                     where_parts.append(table_filter)
                 if edge_predicate:
                     where_parts.append(edge_predicate)
+                if p.vlp_node_predicate is not None:
+                    where_parts.append(
+                        f"{next_expr} IN "
+                        f"(SELECT node FROM bfs_vlp_nodes_ok_{p.n})"
+                    )
                 parts.append(
                     f"SELECT "
                     f"{select_prefix}, "
@@ -1662,6 +1732,8 @@ class ProceduralBFSRenderer:
         declarations = self._nv_declarations(p)
 
         body_parts: list[str] = []
+        if p.vlp_node_predicate is not None:
+            body_parts.append(self._nv_vlp_nodes_ok_init(p))
         body_parts.append(self._nv_frontier_init(p))
         body_parts.append(self._nv_visited_init(p))
         if self._adjacency_active(p):
@@ -1670,6 +1742,22 @@ class ProceduralBFSRenderer:
         body_parts.append(self._nv_final_view(p))
 
         return declarations, "\n\n".join(body_parts)
+
+    def _nv_vlp_nodes_ok_init(self, p: _BFSParams) -> str:
+        """Create the static VLP passing-node view (pre-loop).
+
+        Fixed name (not depth-numbered) — a plain statement outside
+        EXECUTE IMMEDIATE, so the predicate needs no quote escaping (same
+        pattern as _nv_adjacency_init). Per-level references use only the
+        view name, keeping the EXECUTE IMMEDIATE strings quote-free for
+        this filter.
+        """
+        return (
+            f"CREATE OR REPLACE TEMPORARY VIEW bfs_vlp_nodes_ok_{p.n} AS\n"
+            f"SELECT DISTINCT nf.{p.vlp_node_id_col} AS node\n"
+            f"FROM {p.vlp_node_table} nf\n"
+            f"WHERE {p.vlp_node_predicate};"
+        )
 
     def _nv_declarations(self, p: _BFSParams) -> str:
         """DECLARE statements for numbered_views strategy."""
@@ -1683,10 +1771,19 @@ class ProceduralBFSRenderer:
         """Create frontier_0 view."""
         where = self._build_start_where(p.node_type_filter, p.start_filter)
 
+        from_clause = f"FROM {p.node_table} n{where}"
+        if p.vlp_node_predicate is not None:
+            vlp_cond = (
+                f"n.{p.node_id_col} IN "
+                f"(SELECT node FROM bfs_vlp_nodes_ok_{p.n})"
+            )
+            from_clause += (
+                f" AND {vlp_cond}" if where else f"\nWHERE {vlp_cond}"
+            )
         return (
             f"CREATE OR REPLACE TEMPORARY VIEW bfs_frontier_{p.n}_0 AS\n"
             f"SELECT n.{p.node_id_col} AS node\n"
-            f"FROM {p.node_table} n{where};"
+            f"{from_clause};"
         )
 
     def _nv_visited_init(self, p: _BFSParams) -> str:
@@ -1722,6 +1819,14 @@ class ProceduralBFSRenderer:
         """
         prop_select = "".join(f", e.{c}" for c in p.edge_prop_cols)
 
+        vlp_in = ""
+        if p.vlp_node_predicate is not None:
+            # Static view name, no quotes inside — EXECUTE IMMEDIATE safe.
+            vlp_in = (
+                f" AND {{next}} IN "
+                f"(SELECT node FROM bfs_vlp_nodes_ok_{p.n})"
+            )
+
         if self._adjacency_active(p):
             visited = self._nv_visited_not_exists(
                 f"bfs_visited_{p.n}", f"bfs_depth_{p.n}", "e._next",
@@ -1735,6 +1840,7 @@ class ProceduralBFSRenderer:
                 f" || CAST(bfs_depth_{p.n} - 1 AS STRING) || ' f "
                 f"ON e._jk = f.node "
                 f"WHERE {visited}"
+                + vlp_in.format(next="e._next")
             )
 
         branches = self._direction_branches(
@@ -1754,6 +1860,11 @@ class ProceduralBFSRenderer:
                     where_parts.append(table_filter.replace("'", "''"))
                 if p.edge_predicate:
                     where_parts.append(p.edge_predicate.replace("'", "''"))
+                if p.vlp_node_predicate is not None:
+                    where_parts.append(
+                        f"{next_expr} IN "
+                        f"(SELECT node FROM bfs_vlp_nodes_ok_{p.n})"
+                    )
 
                 where_clause = " AND ".join(where_parts)
                 parts.append(

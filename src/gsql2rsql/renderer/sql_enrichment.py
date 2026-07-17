@@ -58,6 +58,7 @@ from gsql2rsql.planner.operators import (
 )
 from gsql2rsql.planner.path_analyzer import (
     rewrite_predicate_for_edge_alias,
+    rewrite_type_calls_to_property,
 )
 from gsql2rsql.planner.schema import EntityField
 from gsql2rsql.renderer.schema_provider import ISQLDBSchemaProvider, SQLTableDescriptor
@@ -188,6 +189,15 @@ class EnrichedNodesListPredicate:
     # Bare-column type filter (e.g. "node_type = 'Person'"); prefix with the
     # subquery alias when emitting. None when the traversal is untyped.
     node_type_filter: str | None = None
+    # operator_debug_id of the RecursiveTraversalOperator whose node_filter
+    # pushdown this expression originated (the ALL was extracted into the
+    # op's node_filter). None for non-pushable predicates (ANY/NONE/SINGLE,
+    # under OR, outer-variable lambdas). When set AND the pushdown is
+    # active (see vlp_node_pushdown_active), the procedural renderer
+    # enforces the predicate via its frontier filter and the expression
+    # renderer emits TRUE for the residual — the only mode-correct
+    # rendering there, since procedural never collects the path array.
+    enforced_by_traversal_op_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -427,6 +437,10 @@ class SQLEnrichmentPass:
         source_id_col = op.source_id_column or "source_id"
         target_id_col = op.target_id_column or "target_id"
         edge_props: list[str] = list(op.edge_properties) if op.edge_properties else []
+        # Column holding the relationship type name (for Cypher type(r)
+        # rewriting in edge lambdas). None when the schema doesn't declare
+        # one — type(r) then fails with a clear renderer error.
+        edge_type_column: str | None = None
 
         if edge_types:
             for edge_type in edge_types:
@@ -466,6 +480,13 @@ class SQLEnrichmentPass:
                         )
                     )
 
+                if (
+                    edge_schema
+                    and edge_schema.type_property
+                    and edge_type_column is None
+                ):
+                    edge_type_column = edge_schema.type_property.property_name
+
                 if len(edge_tables) == 1 and edge_schema:
                     if edge_schema.source_id_property:
                         source_id_col = edge_schema.source_id_property.property_name
@@ -493,6 +514,10 @@ class SQLEnrichmentPass:
                     source_id_col = wildcard_schema.source_id_property.property_name
                 if wildcard_schema.sink_id_property:
                     target_id_col = wildcard_schema.sink_id_property.property_name
+                if wildcard_schema.type_property:
+                    edge_type_column = (
+                        wildcard_schema.type_property.property_name
+                    )
                 if op.collect_edges and not edge_props:
                     for prop in wildcard_schema.properties:
                         if prop.property_name not in (source_id_col, target_id_col):
@@ -533,8 +558,21 @@ class SQLEnrichmentPass:
         sink_filter_as_sink = None
 
         if op.edge_filter and op.edge_filter_lambda_var:
+            edge_filter_ast = op.edge_filter
+            # Cypher type(r) -> r.<type column> (resolved from the edge
+            # schema). Done BEFORE alias rewriting so the pushed-down CTE
+            # filter renders as e.<type column>. When the schema declares
+            # no type column, the TYPE call is left as-is and the renderer
+            # fails with a clear unsupported-function error (never a
+            # silently wrong filter).
+            if edge_type_column:
+                edge_filter_ast = rewrite_type_calls_to_property(
+                    edge_filter_ast,
+                    op.edge_filter_lambda_var,
+                    edge_type_column,
+                )
             edge_filter_as_e = rewrite_predicate_for_edge_alias(
-                op.edge_filter, op.edge_filter_lambda_var,
+                edge_filter_ast, op.edge_filter_lambda_var,
                 edge_alias="e",
             )
         if op.start_node_filter and op.source_alias:
@@ -706,7 +744,7 @@ class SQLEnrichmentPass:
                     lp.filter_expression, lp.variable_name
                 ):
                     continue
-                enriched = self._enrich_nodes_predicate(path_op)
+                enriched = self._enrich_nodes_predicate(lp, path_op)
                 if enriched is not None:
                     nodes_predicates[expr_id] = enriched
 
@@ -715,8 +753,23 @@ class SQLEnrichmentPass:
         lp: QueryExpressionListPredicate,
         path_var_map: dict[str, RecursiveTraversalOperator],
     ) -> RecursiveTraversalOperator | None:
-        """Return the traversal op if ``lp`` iterates ``nodes(<path var>)``."""
+        """Return the traversal op if ``lp`` iterates ``nodes(<path var>)``.
+
+        Also matches ``nodes(<path var>)[a..b]`` (a LIST_SLICE wrapping the
+        nodes() call): the fallback subquery correlates via
+        ARRAY_CONTAINS over whatever the list expression renders to, so a
+        sliced path array works unchanged. Note the PUSHDOWN never fires
+        for sliced forms — path_analyzer requires a bare nodes(path) —
+        because endpoint-filtering the traversal would wrongly constrain
+        nodes the slice excludes.
+        """
         list_expr = lp.list_expression
+        if (
+            isinstance(list_expr, QueryExpressionFunction)
+            and list_expr.function == Function.LIST_SLICE
+            and list_expr.parameters
+        ):
+            list_expr = list_expr.parameters[0]
         if not isinstance(list_expr, QueryExpressionFunction):
             return None
         if list_expr.function != Function.NODES:
@@ -731,7 +784,9 @@ class SQLEnrichmentPass:
         return None
 
     def _enrich_nodes_predicate(
-        self, path_op: RecursiveTraversalOperator
+        self,
+        lp: QueryExpressionListPredicate,
+        path_op: RecursiveTraversalOperator,
     ) -> EnrichedNodesListPredicate | None:
         """Resolve the node table used to look up path node properties.
 
@@ -739,14 +794,25 @@ class SQLEnrichmentPass:
         intermediate nodes are not constrained to the source/target types —
         so the wildcard node table (the full node set) is the correct
         lookup target, with no type filter.
+
+        Also records (by expression identity) whether this exact ALL was
+        extracted into the traversal op's node_filter — the procedural
+        renderer enforces those via its frontier filter.
         """
         node_info = self._resolve_node_info(WILDCARD_NODE_TYPE)
         if node_info is None:
             return None
+
+        enforced_op_id: int | None = None
+        source_exprs = getattr(path_op, "node_filter_source_exprs", [])
+        if any(lp is src for src in source_exprs):
+            enforced_op_id = path_op.operator_debug_id
+
         return EnrichedNodesListPredicate(
             node_table_name=node_info.table_descriptor.full_table_name,
             node_id_column=node_info.id_column,
             node_type_filter=None,
+            enforced_by_traversal_op_id=enforced_op_id,
         )
 
     def _enrich_exists_expr(
@@ -888,3 +954,25 @@ def _lambda_accesses_properties(
         ):
             return True
     return False
+
+
+def vlp_node_pushdown_active(
+    enriched_rec: EnrichedRecursiveOp | None,
+    config: dict[str, object],
+) -> bool:
+    """Single eligibility rule for VLP node predicate pushdown.
+
+    Consulted by BOTH the traversal renderers (to decide whether to filter
+    the traversal) and the expression renderer (to decide how to render the
+    originating ALL). They MUST agree: in procedural mode the frontier
+    filter is the only enforcement of the predicate (the path array is
+    never collected), so a renderer applying the pushdown while the
+    expression renderer refuses — or vice versa — would either drop the
+    filter silently or reject a supported query.
+    """
+    return (
+        enriched_rec is not None
+        and enriched_rec.node_filter_as_nf is not None
+        and enriched_rec.node_pushdown_node is not None
+        and bool(config.get("enable_vlp_node_pushdown", True))
+    )

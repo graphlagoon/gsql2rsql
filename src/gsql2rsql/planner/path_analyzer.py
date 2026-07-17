@@ -147,6 +147,14 @@ class PathUsageInfo:
     # that skips the pushdown stays correct — just slower.
     node_predicates: list[QueryExpression] = field(default_factory=list)
     node_lambda_variable: str = ""
+    # The originating ALL(...) expressions for node_predicates. NOT removed
+    # from the WHERE clause (unlike pushed_all_expressions) — kept so that
+    # renderers which fully ENFORCE the predicate during traversal (the
+    # procedural BFS frontier filter) can identify these exact expressions
+    # and render them as TRUE instead of an unsupported path-array subquery.
+    node_pushed_source_exprs: list[QueryExpression] = field(
+        default_factory=list
+    )
 
     @property
     def has_pushable_predicates(self) -> bool:
@@ -274,6 +282,7 @@ class PathExpressionAnalyzer:
         path_variable: str,
         where_expr: QueryExpression | None,
         return_exprs: list[QueryExpression] | None = None,
+        relationship_variable: str = "",
     ) -> PathUsageInfo:
         """Analyze expressions to determine path usage and optimization opportunities.
 
@@ -306,6 +315,7 @@ class PathExpressionAnalyzer:
             [<QueryExpressionBinary: r.x > 1>]  # Can be pushed down
         """
         info = PathUsageInfo(path_variable=path_variable)
+        self._relationship_variable = relationship_variable
 
         # Analyze WHERE clause. The root of a WHERE clause is a conjunctive
         # position: an ALL() found here (or under a chain of ANDs) must hold
@@ -432,6 +442,7 @@ class PathExpressionAnalyzer:
                     info.node_predicates.append(expr.filter_expression)
                     if not info.node_lambda_variable:
                         info.node_lambda_variable = expr.variable_name
+                    info.node_pushed_source_exprs.append(expr)
 
         # -----------------------------------------------------------------
         # Cases 3 & 4: REDUCE and list comprehensions
@@ -536,6 +547,17 @@ class PathExpressionAnalyzer:
         if isinstance(expr, QueryExpressionFunction):
             if expr.function and expr.function == Function.RELATIONSHIPS:
                 return self._references_path_variable(expr.parameters, path_var)
+        # A bare reference to the user-declared relationship variable
+        # ([arestas*1..3]) IS the list of traversed relationships:
+        # ALL(r IN arestas ...) ≡ ALL(r IN relationships(path) ...).
+        rel_var = getattr(self, "_relationship_variable", "")
+        if (
+            rel_var
+            and isinstance(expr, QueryExpressionProperty)
+            and expr.variable_name == rel_var
+            and not expr.property_name
+        ):
+            return True
         return False
 
     def _is_nodes_of_path(
@@ -550,6 +572,56 @@ class PathExpressionAnalyzer:
         return False
 
 
+def rewrite_type_calls_to_property(
+    predicate: QueryExpression,
+    lambda_var: str,
+    type_column: str,
+) -> QueryExpression:
+    """Rewrite ``type(<lambda_var>)`` calls to ``<lambda_var>.<type_column>``.
+
+    Cypher ``type(r)`` returns the relationship type name; in the
+    single-edge-table storage model that is a plain column. Rewriting at
+    the AST level (before alias rewriting) makes ``type(r)`` work both in
+    the pushed-down CTE filter (``e.<col>``) and in edge-struct lambdas.
+
+    Shallow-copy semantics identical to rewrite_predicate_for_edge_alias.
+    """
+    from copy import copy
+
+    if isinstance(predicate, QueryExpressionFunction):
+        if (
+            predicate.function == Function.TYPE
+            and len(predicate.parameters) == 1
+            and isinstance(predicate.parameters[0], QueryExpressionProperty)
+            and predicate.parameters[0].variable_name == lambda_var
+            and not predicate.parameters[0].property_name
+        ):
+            return QueryExpressionProperty(
+                variable_name=lambda_var,
+                property_name=type_column,
+            )
+        new_fn = copy(predicate)
+        new_fn.parameters = [
+            rewrite_type_calls_to_property(p, lambda_var, type_column)
+            for p in predicate.parameters
+        ]
+        return new_fn
+
+    if isinstance(predicate, QueryExpressionBinary):
+        new_bin = copy(predicate)
+        if predicate.left_expression is not None:
+            new_bin.left_expression = rewrite_type_calls_to_property(
+                predicate.left_expression, lambda_var, type_column
+            )
+        if predicate.right_expression is not None:
+            new_bin.right_expression = rewrite_type_calls_to_property(
+                predicate.right_expression, lambda_var, type_column
+            )
+        return new_bin
+
+    return predicate
+
+
 def _references_only_variable(
     expr: QueryExpression, lambda_var: str
 ) -> bool:
@@ -557,8 +629,16 @@ def _references_only_variable(
 
     A predicate that also reads outer variables (e.g. ``n.x > d.limit``)
     cannot be evaluated per node against the node table alone, so it is
-    not eligible for node-predicate pushdown.
+    not eligible for node-predicate pushdown. Graph pattern predicates
+    (``size((n)--())`` parses to a pattern-EXISTS) are likewise not
+    per-row-evaluable against the node table and are excluded here — the
+    renderer then rejects them with a clear error instead of pushing an
+    unevaluable filter.
     """
+    from gsql2rsql.parser.ast import QueryExpressionExists
+
+    if isinstance(expr, QueryExpressionExists):
+        return False
     if isinstance(expr, QueryExpressionProperty):
         return expr.variable_name == lambda_var
     for child in expr.children:

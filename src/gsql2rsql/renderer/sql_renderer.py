@@ -1082,6 +1082,16 @@ class SQLRenderer:
                 if len(params) >= 2:
                     return f"CONTAINS({params[0]}, {params[1]})"
                 return "NULL"
+            elif func == Function.TYPE:
+                # type(r) is resolved to r.<type column> only in the pushed
+                # VLP edge lambda. In a single-hop WHERE it never gets
+                # rewritten — fail clearly, not with an internal error.
+                raise TranspilerNotSupportedException(
+                    "type(<rel>) is currently supported only inside a "
+                    "variable-length ALL(r IN relationships(p) WHERE ...) "
+                    "predicate. Reference the relationship-type column "
+                    "directly (e.g. r.relationship_type = 'KNOWS')."
+                )
             raise NotImplementedError(
                 f"_render_datasource_filter: unsupported function {func!r}. "
                 f"Add an explicit handler for this function."

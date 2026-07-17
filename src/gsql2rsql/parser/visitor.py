@@ -978,18 +978,76 @@ class CypherVisitor:
     def visit_oC_NonArithmeticOperatorExpression(
         self, ctx: Any
     ) -> QueryExpression:
-        """Visit a non-arithmetic operator expression context (new grammar)."""
-        # This goes to oC_Atom directly in new grammar
+        """Visit a non-arithmetic operator expression context (new grammar).
+
+        Grammar:
+            oC_Atom ( oC_ListOperatorExpression | oC_PropertyLookup )*
+
+        Postfix operators are applied left-to-right in source order:
+        ``nodes(p)[0..-1]`` wraps the nodes() call in a LIST_SLICE,
+        ``xs[0].name`` indexes first, then looks up the property.
+        """
         result = self.visit(ctx.oC_Atom())
 
-        # Handle property lookups
-        if hasattr(ctx, "oC_PropertyLookup") and ctx.oC_PropertyLookup():
-            for prop_ctx in ctx.oC_PropertyLookup():
-                prop_name = self.visit(prop_ctx)
+        for i in range(ctx.getChildCount()):
+            child = ctx.getChild(i)
+            rule_name = type(child).__name__
+            if rule_name == "OC_PropertyLookupContext":
+                prop_name = self.visit(child)
                 if isinstance(result, QueryExpressionProperty) and prop_name:
                     result.property_name = prop_name
+            elif rule_name == "OC_ListOperatorExpressionContext":
+                result = self._apply_list_operator(result, child)
 
         return result
+
+    def _apply_list_operator(
+        self, target: QueryExpression, ctx: Any
+    ) -> QueryExpression:
+        """Wrap *target* in LIST_INDEX / LIST_SLICE from a ``[...]`` postfix.
+
+        Grammar:
+            ( '[' oC_Expression ']' )                      -> index
+            | ( '[' oC_Expression? '..' oC_Expression? ']' ) -> slice
+
+        Slices always carry exactly 3 parameters (list, start, end);
+        omitted bounds become NULL literals so the renderer can
+        distinguish ``[..b]`` / ``[a..]`` / ``[a..b]`` positionally.
+        """
+        exprs = [self.visit(e) for e in ctx.oC_Expression()]
+        is_slice = ".." in ctx.getText()
+
+        if not is_slice:
+            return QueryExpressionFunction(
+                function=Function.LIST_INDEX,
+                parameters=[target, exprs[0]],
+            )
+
+        # Positional bounds: figure out which side of '..' each expr is on.
+        start: QueryExpression = QueryExpressionValue(
+            value=None, value_type=type(None)
+        )
+        end: QueryExpression = QueryExpressionValue(
+            value=None, value_type=type(None)
+        )
+        dotdot_seen = False
+        expr_iter = iter(exprs)
+        for i in range(ctx.getChildCount()):
+            child = ctx.getChild(i)
+            text = child.getText() if hasattr(child, "getText") else ""
+            if text == "..":
+                dotdot_seen = True
+            elif type(child).__name__ == "OC_ExpressionContext":
+                value = next(expr_iter)
+                if dotdot_seen:
+                    end = value
+                else:
+                    start = value
+
+        return QueryExpressionFunction(
+            function=Function.LIST_SLICE,
+            parameters=[target, start, end],
+        )
 
     def visit_oC_PropertyLookup(self, ctx: Any) -> str | None:
         """Visit a property lookup context."""
