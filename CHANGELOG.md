@@ -2,6 +2,13 @@
 
 
 
+## v0.12.0 (2026-07-20)
+
+### Feature
+
+* feat: new operator on recursive queires with conditions ([`c130bac`](https://github.com/graphlagoon/gsql2rsql/commit/c130bacb68773b36310490bef9af22b405609a92))
+
+
 ## v0.11.0 (2026-07-16)
 
 ### Feature
