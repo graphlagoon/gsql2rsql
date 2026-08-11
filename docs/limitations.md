@@ -92,6 +92,31 @@ and the query works.
     `gsql2rsql procedural BFS is single-source but the start filter matched
     multiple nodes` rather than fabricating unreachable (start, end) pairs.
 
+### Multi-source traversals in procedural mode
+
+A property filter like `{DeviceType: 'desktop'}` **transpiles** fine in
+procedural mode — the transpiler cannot know how many rows it matches —
+but hits the runtime guard above as soon as it matches more than one node.
+The procedural BFS tables (`frontier`, `visited`, result) carry no seed
+column, so with several seeds every discovered node would be attributed to
+every seed (a cross join of wrong answers). Options today:
+
+1. **Use CTE mode** (`vlp_rendering_mode="cte"` or just drop the
+   argument). This is the right tool for multi-source, and for shallow
+   traversals (`*1..2`, `*1..3`) it is also the faster one — procedural
+   mode only pays off on *deep* traversals.
+2. **Loop per seed** from the driver: fetch the matching ids first, then
+   run the procedural query once per seed with
+   `{node_id: '<id>'}` and union the results. Correct, but costs
+   `seeds × BFS` with no shared work.
+
+Lifting the limitation properly means adding a `seed` column to the
+frontier/visited/result tables (what CTE mode already does with
+`start_node`). The blocker is not the rewrite itself but that every
+procedural memory optimization was designed and A/B-validated for the
+single-column frontier — see the developer notes in
+`docs_help_dev/limitations.md` if you plan to work on this.
+
 ---
 
 ## Schema Binding Errors
