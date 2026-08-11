@@ -509,13 +509,17 @@ sql = graph.transpile("""
 
 ## Limitations
 
+The most common ones:
+
 - **Databricks new Runtime** required for `WITH RECURSIVE` and HoF
-- **Write operations** not supported (`CREATE`, `DELETE`, `SET`)
-- **Multi-label node syntax** not yet supported:
-    - `(a:Person|Company)` - pipe OR syntax causes parser error
-    - `(a:Person:Company)` - colon AND syntax silently ignores additional labels
-    - **Workaround:** Use `WHERE a.node_type IN ['Person', 'Company']`
-- **Some Cypher features** not yet implemented
+- **Write operations** not supported (`CREATE`, `DELETE`, `SET`, `MERGE`)
+- **Multi-label node syntax** not yet supported — use
+  `WHERE a.node_type IN ['Person', 'Company']`
+- **Procedural BFS mode** is single-source and rejects `length(p)`,
+  `nodes(p)` and `*0..N` (CTE mode supports all of these)
+
+See the full **[Limitations](limitations.md)** page for the complete list,
+the CTE vs procedural feature matrix, and a guide to the error messages.
 
 ---
 
