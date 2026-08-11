@@ -2,6 +2,101 @@
 
 
 
+## v0.12.2 (2026-08-11)
+
+### Documentation
+
+* docs: multi-source procedural BFS — why it fails at runtime and the options
+
+A property start filter transpiles in procedural mode (cardinality is
+data-dependent) and hits the embedded single-seed RAISE_ERROR when it
+matches several nodes. Document the architectural reason (no seed column
+in frontier/visited/result), the two workarounds (CTE mode; per-seed
+loop), and — in the developer notes — the two designs to lift it, with
+the real cost being re-A/B of every memory-optimization flag rather than
+the rewrite itself.
+
+Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt; ([`6ed6450`](https://github.com/graphlagoon/gsql2rsql/commit/6ed6450448828177b35ab331db53f25b35055773))
+
+### Fix
+
+* fix: silent wrong answers in joins, aggregates, naming + loud error contracts
+
+Fixes the ten defects catalogued in docs_help_dev/testing/test-failures-report.md
+(F1-F10), each backed by new tests that failed before and pass after.
+
+Silent wrong answers:
+- Repeated pattern variable ((a)-[:T]-&gt;(a), closed cycles) never emitted the
+  closing SINK join pair, returning every path instead of every cycle. The
+  shared-variable branch in match_tree now binds the node to the preceding
+  relationship&#39;s far endpoint before skipping the duplicate data source.
+- percentileCont/percentileDisc vanished: the visitor dropped arguments past
+  the first (new extra_parameters on the aggregation AST node) and the
+  renderer had no pattern (PERCENTILE_CONT({1}) WITHIN GROUP (ORDER BY {0})).
+  Pattern-less aggregates now raise instead of emitting the bare operand.
+- LIMIT $n / SKIP $s were silently discarded; _extract_int_value now raises
+  TranspilerNotSupportedException for non-literal expressions.
+- RETURN a.name, b.name emitted two columns both named &#34;name&#34;; colliding
+  auto-derived aliases are qualified as a_name/b_name (explicit AS untouched).
+- RETURN * / WITH * leaked internal _gsql2rsql_* columns and anonymous edge
+  plumbing; the star now expands to the named variables in scope.
+
+Invalid SQL made valid or loud:
+- size(&lt;string&gt;) renders LENGTH() via type dispatch from the operator&#39;s input
+  schema (AST data_type is often unset at render time).
+- list + list renders CONCAT(), with list literals as ARRAY(...) operands.
+- WHERE a:Person label predicates raise with a move-into-pattern hint instead
+  of rendering a non-boolean WHERE (both grammar paths).
+- Unknown functions raise TranspilerNotSupportedException naming what the
+  user wrote (raw_name) instead of leaking NotImplementedError(INVALID).
+- add_edge derives missing source/sink id properties from the descriptor&#39;s
+  node_id_columns and rejects only when underivable, so hand-built schemas
+  can no longer produce dangling join keys.
+
+Documented (not fixed): relationship uniqueness (edge isomorphism) is not
+enforced in fixed-length patterns - guarded by a strict xfail; unbounded VLP
+depth cap of 10 is now documented and locked by tests.
+
+Test infrastructure: get_base_spark() probes SparkContext liveness so modules
+using the shared session survive legacy modules that call spark.stop().
+
+Suites: non-PySpark 1801 passed / 7 skipped / 1 xfailed; PySpark 261 passed /
+6 xfailed; pyright and mypy at 0 errors.
+
+Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt; ([`41c10d3`](https://github.com/graphlagoon/gsql2rsql/commit/41c10d3852218dfa3257c27cb4deec37ab35d368))
+
+* fix: actionable errors for unknown edge types + user-facing limitations docs
+
+Planner (data_source.py, recursive_traversal.py):
+- Unknown relationship types (single-hop AND VLP) used to either fail with
+  a generic &#34;Failed to bind relationship&#34; (single-hop) or a confusing
+  &#34;Internal error: No enriched data for RecursiveTraversalOperator&#34; three
+  phases later in Enrichment (VLP) -- the latter reading as a transpiler
+  bug when it&#39;s a schema/config mismatch. A typo inside an OR list
+  ([:OWNS|KNOWS]) silently transpiled, dropping the bad type instead of
+  raising.
+- Added validate_edge_verbs_exist()/_describe_available_edge_verbs() in
+  data_source.py, called from both binding sites, mirroring the node-type
+  diagnostics: lists registered edge types, suggests a case-insensitive
+  near-match. Distinguishes &#34;verb exists for no endpoint pair&#34; (typo,
+  raises) from &#34;verb exists but not for these endpoints&#34; (silently pruned
+  from OR lists -- load-bearing for restricted edge_combinations schemas).
+- get_all_edge_schemas() added to SimpleSQLSchemaProvider.
+
+Docs:
+- New docs/limitations.md (mkdocs nav: User Guide &gt; Limitations):
+  user-facing quick-reference table, CTE vs procedural feature matrix,
+  schema-binding error guide, parser notes (backticks, unaliased
+  projection aliases, != rejection), correctness/performance caveats.
+  user-guide.md&#39;s inline section now summarizes and links to it.
+- fix_transpiler_bugs skill: new step 7 requiring both limitations docs
+  (docs_help_dev/ internal, docs/ user-facing) to be updated whenever a
+  fix adds/removes a guardrail or NotSupported path.
+
+Tests: tests/test_unknown_edge_type_errors.py (10 cases: single-hop, VLP,
+OR-list typo detection, endpoint-pruning-not-a-typo regression). ([`554761c`](https://github.com/graphlagoon/gsql2rsql/commit/554761cb1940334d5cf445f7d70c98c95f725d57))
+
+
 ## v0.12.1 (2026-08-11)
 
 ### Fix
