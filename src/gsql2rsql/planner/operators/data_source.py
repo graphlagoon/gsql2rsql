@@ -22,6 +22,51 @@ from gsql2rsql.planner.schema import (
 )
 
 
+def _describe_available_node_types(
+    graph_definition: IGraphSchemaProvider,
+    requested: str,
+) -> str:
+    """Build an actionable suffix for a failed node-type binding.
+
+    A bare "failed to bind" says nothing about *why* the lookup missed.  The
+    lookup is an exact, case-sensitive match against the registered type
+    names, so the overwhelmingly common causes are a case difference or
+    stray whitespace in the schema registration.  Surfacing the registered
+    names — and any case-insensitive near-match — turns a dead end into a
+    one-line fix.
+
+    Best-effort only: providers are not required to enumerate their types,
+    so any failure here degrades to an empty suffix rather than masking the
+    original binding error.
+    """
+    try:
+        get_all = getattr(graph_definition, "get_all_node_schemas", None)
+        if get_all is None:
+            return ""
+        available = sorted(
+            schema.name for schema in get_all() if getattr(schema, "name", None)
+        )
+    except Exception:  # pragma: no cover - defensive
+        return ""
+
+    if not available:
+        return ""
+
+    near = [
+        name
+        for name in available
+        if name.strip().casefold() == requested.strip().casefold()
+    ]
+    hint = ""
+    if near:
+        hint = (
+            f" Did you mean '{near[0]}'? Node type names are matched exactly "
+            f"(case-sensitive, whitespace-sensitive)."
+        )
+
+    return f".{hint} Available node types: {', '.join(repr(n) for n in available)}"
+
+
 @dataclass
 class _BindingResult:
     """Result of binding an entity to a graph schema.
@@ -122,6 +167,7 @@ class DataSourceOperator(StartLogicalOperator, IBindable):
                 raise TranspilerBindingException(
                     f"Failed to bind entity '{node_entity.alias}' "
                     f"of type '{entity_name}'"
+                    + _describe_available_node_types(graph_definition, entity_name)
                 )
 
         # Build node ID field if available

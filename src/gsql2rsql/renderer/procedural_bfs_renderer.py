@@ -620,11 +620,35 @@ class ProceduralBFSRenderer:
             raise TranspilerNotSupportedException(
                 "Procedural BFS requires a finite max_hops bound."
             )
+        if op.min_hops == 0:
+            raise TranspilerNotSupportedException(
+                "Procedural BFS does not support *0..N patterns: the "
+                "depth-0 row (the start node itself) is never emitted, so "
+                "results would silently omit it. Use "
+                "vlp_rendering_mode='cte' for zero-length paths."
+            )
 
         enriched = self._get_enriched(op)
         if enriched.source_node is None:
             raise TranspilerNotSupportedException(
                 "Procedural BFS requires a resolvable start node."
+            )
+        # Single-source architecture: one global visited set plus a CROSS
+        # JOIN against the seed frontier to attribute the start node. An
+        # unfiltered source seeds EVERY node, so the visited anti-join
+        # discards all expansions (empty results) and any multi-node seed
+        # fabricates (start, end) pairs that are not connected. A start
+        # filter is therefore mandatory; cardinality is re-checked at
+        # runtime by the seed guard emitted into the script.
+        if (
+            enriched.start_filter_as_n is None
+            and enriched.start_filter_as_src is None
+        ):
+            raise TranspilerNotSupportedException(
+                "Procedural BFS is single-source: the traversal start must "
+                "be narrowed to one node by a property filter (e.g. "
+                "{origin_id: '...'}). Chained/unfiltered VLP sources are "
+                "not representable. Use vlp_rendering_mode='cte'."
             )
         if op.bidirectional_bfs_mode != "off":
             if enriched.target_node is None:
@@ -1145,6 +1169,7 @@ class ProceduralBFSRenderer:
             f"CREATE TEMPORARY TABLE bfs_frontier_{p.n}_init AS\n"
             f"SELECT node FROM bfs_frontier_{p.n};"
         )
+        lines.append(self._seed_guard(p, f"bfs_frontier_{p.n}_init"))
 
         # Keyed edge copy: materialized once, before the loop (O9). Must
         # precede the adjacency, which is built from it when both are on.
@@ -1164,6 +1189,26 @@ class ProceduralBFSRenderer:
             )
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _seed_guard(p: _BFSParams, frontier_view: str) -> str:
+        """Runtime guard: fail loudly if the seed has more than one node.
+
+        The static ``_validate`` check requires a start filter, but only the
+        executed script can see how many nodes that filter actually matched.
+        With >1 seed the CROSS JOIN start attribution fabricates
+        (start, end) pairs, so wrong results must be prevented at runtime.
+        A mid-script SELECT is executed and its result discarded, which
+        makes ``IF(..., RAISE_ERROR(...), TRUE)`` a strategy-agnostic guard
+        (no DECLAREd variable needed).
+        """
+        return (
+            f"SELECT IF(COUNT(*) > 1, RAISE_ERROR("
+            f"'gsql2rsql procedural BFS is single-source but the start "
+            f"filter matched multiple nodes. "
+            f"Use vlp_rendering_mode=\"cte\" for multi-source traversals.'"
+            f"), TRUE) FROM {frontier_view};"
+        )
 
     def _tt_edge_expansion_sql(self, p: _BFSParams) -> str:
         """Build edge expansion SELECT for temp_tables (no quote escaping).
@@ -1783,7 +1828,8 @@ class ProceduralBFSRenderer:
         return (
             f"CREATE OR REPLACE TEMPORARY VIEW bfs_frontier_{p.n}_0 AS\n"
             f"SELECT n.{p.node_id_col} AS node\n"
-            f"{from_clause};"
+            f"{from_clause};\n"
+            f"{self._seed_guard(p, f'bfs_frontier_{p.n}_0')}"
         )
 
     def _nv_visited_init(self, p: _BFSParams) -> str:

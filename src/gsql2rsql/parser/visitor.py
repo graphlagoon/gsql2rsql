@@ -50,6 +50,91 @@ from gsql2rsql.parser.operators import (
 )
 
 
+def unescape_symbolic_name(name: str) -> str:
+    """Strip backtick delimiters from an openCypher EscapedSymbolicName.
+
+    openCypher allows any identifier — label, relationship type, variable,
+    property key — to be escaped with backticks so it may contain characters
+    that are otherwise illegal::
+
+        MATCH (n:`My Label`) RETURN n.`first name`
+
+    The backticks are delimiters, not part of the name, so ``:`Person``` and
+    ``:Person`` must both bind to the node type ``Person``.  A doubled
+    backtick inside the escape is the literal escape for one backtick.
+
+    Non-escaped names are returned unchanged.
+    """
+    if len(name) >= 2 and name.startswith("`") and name.endswith("`"):
+        return name[1:-1].replace("``", "`")
+    return name
+
+
+def split_escaped_labels(labels_text: str) -> list[str]:
+    """Split a label/type list on ``:`` respecting backtick escapes.
+
+    ``oC_NodeLabels``/``oC_RelationshipTypes`` arrive as raw text such as
+    ``":Person:Employee"`` or ``":`My Label`:Other"``.  A naive
+    ``lstrip(':')`` + ``split(':')`` corrupts escaped names that contain a
+    colon (``:`a:b``` would become ``a``), so the separator is only honoured
+    outside backticks.
+
+    Returns the unescaped names in order, with empty segments dropped.
+    """
+    names: list[str] = []
+    current: list[str] = []
+    in_backticks = False
+
+    for char in labels_text:
+        if char == "`":
+            in_backticks = not in_backticks
+            current.append(char)
+        elif char == ":" and not in_backticks:
+            if current:
+                names.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+
+    if current:
+        names.append("".join(current))
+
+    return [unescape_symbolic_name(n) for n in names]
+
+
+def sanitize_expression_alias(expression_text: str) -> str:
+    """Derive a bare SQL identifier from raw Cypher expression text.
+
+    openCypher names an unaliased projection after the expression itself, so
+    ``RETURN count(DISTINCT d)`` yields a column called ``count(DISTINCT d)``.
+    That name is not a legal bare SQL identifier, and the renderer emits
+    aliases unquoted, so the punctuation is folded to underscores:
+
+        ``count(DISTINCT d)``  -> ``count_DISTINCT_d``
+        ``n.age + 1``          -> ``n_age_1``
+        ``count(*)``           -> ``count_star``
+
+    Returns an empty string if nothing usable survives, letting the caller
+    fall back to its own default rather than emitting a broken alias.
+    """
+    if not expression_text:
+        return ""
+
+    # '*' carries meaning (count(*) vs count(x)) so name it rather than drop it
+    text = expression_text.replace("*", "_star_")
+
+    sanitized = "".join(
+        char if char.isalnum() or char == "_" else "_" for char in text
+    )
+    sanitized = "_".join(part for part in sanitized.split("_") if part)
+
+    # A leading digit is not a legal identifier start (e.g. `RETURN 42`)
+    if sanitized and sanitized[0].isdigit():
+        sanitized = f"_{sanitized}"
+
+    return sanitized
+
+
 class CypherVisitor:
     """
     Visitor that converts ANTLR parse tree to openCypher AST.
@@ -351,7 +436,7 @@ class CypherVisitor:
         list_expression = self.visit(ctx.oC_Expression())
 
         # Get the variable name
-        variable_name = ctx.oC_Variable().getText()
+        variable_name = unescape_symbolic_name(ctx.oC_Variable().getText())
 
         return UnwindClause(
             list_expression=list_expression,
@@ -375,7 +460,9 @@ class CypherVisitor:
             for part_ctx in ctx.oC_Pattern().oC_PatternPart() or []:
                 # Check for path variable assignment: path = (a)-[]->(b)
                 if part_ctx.oC_Variable():
-                    path_variable = part_ctx.oC_Variable().getText()
+                    path_variable = unescape_symbolic_name(
+                        part_ctx.oC_Variable().getText()
+                    )
 
                 # Get the pattern elements
                 if part_ctx.oC_AnonymousPatternPart():
@@ -463,15 +550,14 @@ class CypherVisitor:
         inline_properties = None
 
         if ctx.oC_Variable():
-            alias = ctx.oC_Variable().getText()
+            alias = unescape_symbolic_name(ctx.oC_Variable().getText())
 
         if ctx.oC_NodeLabels():
             labels = ctx.oC_NodeLabels().getText()
-            # Remove leading colon
-            entity_name = labels.lstrip(":")
-            # Take first label if multiple
-            if ":" in entity_name:
-                entity_name = entity_name.split(":")[0]
+            # Backtick-aware split; take first label if multiple
+            parsed_labels = split_escaped_labels(labels)
+            if parsed_labels:
+                entity_name = parsed_labels[0]
 
         # NEW: Extract inline properties if present
         if ctx.oC_Properties():
@@ -547,10 +633,16 @@ class CypherVisitor:
 
         if detail_ctx:
             if detail_ctx.oC_Variable():
-                alias = detail_ctx.oC_Variable().getText()
+                alias = unescape_symbolic_name(detail_ctx.oC_Variable().getText())
             if detail_ctx.oC_RelationshipTypes():
                 types_text = detail_ctx.oC_RelationshipTypes().getText()
-                entity_name = types_text.lstrip(":")
+                # Multi-type OR syntax (:A|B|:C) is kept joined by '|' — the
+                # planner splits it — but each type is unescaped individually.
+                entity_name = "|".join(
+                    name
+                    for part in types_text.split("|")
+                    for name in split_escaped_labels(part)
+                )
 
             # Extract variable-length path information (e.g., *1..5)
             if detail_ctx.oC_RangeLiteral():
@@ -711,9 +803,15 @@ class CypherVisitor:
 
         alias = None
         if ctx.oC_Variable():
-            alias = ctx.oC_Variable().getText()
+            alias = unescape_symbolic_name(ctx.oC_Variable().getText())
         elif isinstance(expr, QueryExpressionProperty):
             alias = expr.property_name or expr.variable_name
+        else:
+            # No explicit AS and not a property access (e.g. `RETURN count(*)`).
+            # openCypher names such a column after the expression text; an
+            # empty alias would emit `SELECT COUNT(*) AS  FROM ...`, which is a
+            # SQL syntax error surfacing only at execution time.
+            alias = sanitize_expression_alias(ctx.oC_Expression().getText())
 
         return QueryExpressionWithAlias(inner_expression=expr, alias=alias or "")
 
@@ -738,7 +836,7 @@ class CypherVisitor:
         # Get alias if present
         alias = ""
         if ctx.oC_Variable():
-            alias = ctx.oC_Variable().getText()
+            alias = unescape_symbolic_name(ctx.oC_Variable().getText())
         elif isinstance(expr, QueryExpressionProperty):
             alias = expr.property_name or expr.variable_name
         else:
@@ -1052,7 +1150,7 @@ class CypherVisitor:
     def visit_oC_PropertyLookup(self, ctx: Any) -> str | None:
         """Visit a property lookup context."""
         if ctx.oC_PropertyKeyName():
-            return ctx.oC_PropertyKeyName().getText()
+            return unescape_symbolic_name(ctx.oC_PropertyKeyName().getText())
         return None
 
     def visit_oC_StringListNullOperatorExpression(
@@ -1086,7 +1184,9 @@ class CypherVisitor:
 
         # Handle property lookups
         for lookup_ctx in ctx.oC_PropertyLookup() or []:
-            prop_name = lookup_ctx.oC_PropertyKeyName().getText()
+            prop_name = unescape_symbolic_name(
+                lookup_ctx.oC_PropertyKeyName().getText()
+            )
             if isinstance(result, QueryExpressionProperty):
                 result.property_name = prop_name
             elif isinstance(result, QueryExpression):
@@ -1126,7 +1226,9 @@ class CypherVisitor:
         if ctx.oC_Parameter():
             return self.visit(ctx.oC_Parameter())
         if ctx.oC_Variable():
-            return QueryExpressionProperty(variable_name=ctx.oC_Variable().getText())
+            return QueryExpressionProperty(
+                variable_name=unescape_symbolic_name(ctx.oC_Variable().getText())
+            )
         if ctx.oC_FunctionInvocation():
             return self.visit(ctx.oC_FunctionInvocation())
         if ctx.oC_ParenthesizedExpression():
@@ -1220,7 +1322,7 @@ class CypherVisitor:
 
         # Pair them up
         for key_ctx, expr_ctx in zip(key_ctxs, expr_ctxs):
-            key_name = key_ctx.getText()
+            key_name = unescape_symbolic_name(key_ctx.getText())
             value_expr = self.visit(expr_ctx)
             if isinstance(value_expr, QueryExpression):
                 entries.append((key_name, value_expr))
@@ -1582,7 +1684,7 @@ class CypherVisitor:
             raise TranspilerSyntaxErrorException(
                 "REDUCE requires an accumulator variable"
             )
-        accumulator_name = acc_var_ctx.getText()
+        accumulator_name = unescape_symbolic_name(acc_var_ctx.getText())
 
         # Get all expressions - there are 2 in the main rule:
         # 1. Initial value (after =)
