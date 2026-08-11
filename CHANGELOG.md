@@ -2,6 +2,60 @@
 
 
 
+## v0.12.1 (2026-08-11)
+
+### Fix
+
+* fix: escaped identifiers, unaliased projections, procedural BFS guardrails
+
+Three parser-phase defects and a set of procedural-BFS correctness
+guardrails, all found while diagnosing a &#34;Failed to bind entity&#34; error
+on a real MATCH ... MATCH (root)-[*1..2]-(d) RETURN count(DISTINCT d)
+query.
+
+Parser (visitor.py):
+- Backtick-escaped identifiers (`Label`, `prop`, `variable`) leaked
+  their delimiters into entity_name/alias, so a correctly-registered
+  node type like `cnpj_raiz` failed to bind because the lookup used
+  the literal string with backticks still attached. Added
+  unescape_symbolic_name()/split_escaped_labels() and applied them at
+  every identifier extraction site: node labels, relationship types
+  (OR-joined), variables, property lookups, map literal keys, UNWIND/
+  path/REDUCE/list-comprehension variables. Table names (which come
+  from schema config, not the Cypher text) are untouched.
+- Unaliased projections (RETURN count(*), RETURN n.age + 1, ...) via
+  the live visit_oC_ProjectionItem path emitted an empty AS alias,
+  producing a SQL syntax error only at execution time. Added
+  sanitize_expression_alias() to derive a column name from the raw
+  Cypher expression text, matching the fallback the legacy (dead)
+  visit_oC_ReturnItem path already had.
+
+Planner (data_source.py):
+- Binding failure on an unknown node type now lists the registered
+  types and flags a case-insensitive near-match, instead of a bare
+  &#34;Failed to bind entity&#34; with no actionable next step.
+
+Renderer (procedural_bfs_renderer.py, sql_renderer.py):
+- Procedural BFS&#39;s single-source architecture (one global visited set
+  + CROSS JOIN frontier attribution) silently produced wrong results
+  for constructs CTE mode handles correctly: unfiltered/chained VLP
+  sources fabricated (start, end) pairs or returned empty, *0..N
+  omitted the start node, and length(p)/nodes(p) evaluated to NULL.
+  Added transpile-time NotSupportedException for all three (pointing
+  callers at vlp_rendering_mode=&#34;cte&#34;), plus a runtime seed-cardinality
+  guard (RAISE_ERROR) since a start filter can still match &gt;1 node.
+  relationships(p) and ALL(n IN nodes(p) WHERE ...) pushdown remain
+  supported in procedural mode.
+
+Verified: pyright/mypy 0 errors; 1738 passed (was 1694) + 7 skipped +
+1 xfailed on the non-PySpark suite; 220 passed + 5 xfailed on PySpark.
+Dual-mode (CTE vs procedural) A/B executed on real PySpark data across
+~30 query variations with hand-computed expected results — no
+divergence or wrong result survives after these fixes.
+
+Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt; ([`3b948d9`](https://github.com/graphlagoon/gsql2rsql/commit/3b948d9b72e9f5e499a88247ca486719a13f2acb))
+
+
 ## v0.12.0 (2026-07-20)
 
 ### Feature
