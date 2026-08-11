@@ -55,10 +55,21 @@ from gsql2rsql.planner.operators import (
 
 
 def _extract_int_value(expr: QueryExpression | None) -> int | None:
-    """Safely extract integer value from a QueryExpressionValue."""
+    """Extract the integer from a literal SKIP/LIMIT expression.
+
+    Anything other than a literal (a ``$param``, an arithmetic expression)
+    must be rejected loudly: returning ``None`` here silently drops the
+    clause, so ``LIMIT $n`` used to return the entire result set.
+    """
+    if expr is None:
+        return None
     if isinstance(expr, QueryExpressionValue) and expr.value is not None:
         return int(expr.value)
-    return None
+    raise TranspilerNotSupportedException(
+        f"SKIP/LIMIT requires an integer literal; got '{expr}'. "
+        f"Parameters (e.g. LIMIT $n) are not supported — inline the value "
+        f"before transpiling."
+    )
 
 
 def _contains_is_terminator(expr: TreeNode) -> bool:
@@ -284,6 +295,22 @@ def create_standard_match_tree(
     for entity_idx, entity in enumerate(match_clause.pattern_parts):
         # Handle shared node variables
         if isinstance(entity, NodeEntity) and entity.alias in joined_node_aliases:
+            # No new data source: the node is already materialised. But the
+            # repetition still constrains the pattern — the preceding
+            # relationship's far endpoint must equal this node (self-loops
+            # `(a)-[:R]->(a)`, closed cycles `(a)->(b)->(a)`). Attach the
+            # SINK pair to the join that brought that relationship in;
+            # skipping it returns every path instead of every cycle.
+            if entity_idx > 0 and isinstance(current_op, JoinOperator):
+                prev_ent = match_clause.pattern_parts[entity_idx - 1]
+                if isinstance(prev_ent, RelationshipEntity):
+                    current_op.add_join_pair(
+                        JoinKeyPair(
+                            node_alias=entity.alias,
+                            relationship_or_node_alias=prev_ent.alias,
+                            pair_type=determine_sink_join_type(prev_ent),
+                        )
+                    )
             prev_node_alias = entity.alias
             continue
 

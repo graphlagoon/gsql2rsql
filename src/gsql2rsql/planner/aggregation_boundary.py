@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from gsql2rsql.common.exceptions import TranspilerNotSupportedException
 from gsql2rsql.parser.ast import (
     MatchClause,
     NodeEntity,
@@ -44,10 +45,21 @@ from gsql2rsql.planner.operators import (
 
 
 def _extract_int_value(expr: QueryExpression | None) -> int | None:
-    """Safely extract integer value from a QueryExpressionValue."""
+    """Extract the integer from a literal SKIP/LIMIT expression.
+
+    Anything other than a literal (a ``$param``, an arithmetic expression)
+    must be rejected loudly: returning ``None`` here silently drops the
+    clause, so ``LIMIT $n`` used to return the entire result set.
+    """
+    if expr is None:
+        return None
     if isinstance(expr, QueryExpressionValue) and expr.value is not None:
         return int(expr.value)
-    return None
+    raise TranspilerNotSupportedException(
+        f"SKIP/LIMIT requires an integer literal; got '{expr}'. "
+        f"Parameters (e.g. LIMIT $n) are not supported — inline the value "
+        f"before transpiling."
+    )
 
 
 def part_creates_aggregation_boundary(

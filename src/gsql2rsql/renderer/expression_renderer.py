@@ -12,6 +12,7 @@ from __future__ import annotations
 from gsql2rsql.common.exceptions import (
     TranspilerInternalErrorException,
     TranspilerNotSupportedException,
+    TranspilerSyntaxErrorException,
 )
 from gsql2rsql.parser.ast import (
     NodeEntity,
@@ -50,7 +51,7 @@ from gsql2rsql.renderer.dialect import (
     render_from_template,
 )
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from gsql2rsql.renderer.render_context import RenderContext
@@ -287,8 +288,25 @@ class ExpressionRenderer:
         right = self.render_expression(expr.right_expression, context_op)
 
         # String concatenation: Cypher + on strings → Spark CONCAT()
+        # List concatenation: Cypher + on lists → Spark CONCAT() too; Spark
+        # has no `+` overload for arrays, so falling through to arithmetic
+        # `+` was a DATATYPE_MISMATCH error at execution time.
         if expr.operator.name == BinaryOperator.PLUS:
-            if self._is_string_concat(expr.left_expression, expr.right_expression):
+            if self._is_array_concat(
+                expr.left_expression, expr.right_expression, context_op
+            ):
+                # List literals render as `(a, b)` for IN clauses; as a
+                # CONCAT operand they must be a real ARRAY value.
+                left = self._render_as_array_value(
+                    expr.left_expression, context_op
+                )
+                right = self._render_as_array_value(
+                    expr.right_expression, context_op
+                )
+                return f"CONCAT({left}, {right})"
+            if self._is_string_concat(
+                expr.left_expression, expr.right_expression, context_op
+            ):
                 return f"CONCAT({left}, {right})"
 
         # Special handling for timestamp subtraction in Databricks SQL
@@ -309,17 +327,97 @@ class ExpressionRenderer:
         return pattern.format(left, right)
 
     def _is_string_concat(
-        self, left: QueryExpression, right: QueryExpression
+        self,
+        left: QueryExpression,
+        right: QueryExpression,
+        context_op: LogicalOperator | None = None,
     ) -> bool:
         """Check if a + operation is string concatenation (not numeric)."""
-        return self._has_string_type(left) or self._has_string_type(right)
+        return self._has_string_type(left, context_op) or self._has_string_type(
+            right, context_op
+        )
 
-    def _has_string_type(self, expr: QueryExpression) -> bool:
+    def _is_array_concat(
+        self,
+        left: QueryExpression,
+        right: QueryExpression,
+        context_op: LogicalOperator | None = None,
+    ) -> bool:
+        """Check if a + operation is list concatenation (not numeric)."""
+        return self._has_array_type(left, context_op) or self._has_array_type(
+            right, context_op
+        )
+
+    def _has_array_type(
+        self,
+        expr: QueryExpression,
+        context_op: LogicalOperator | None = None,
+    ) -> bool:
+        """Check if an expression is list-typed (literal or schema type)."""
+        if isinstance(expr, QueryExpressionList):
+            return True
+        if expr.evaluate_type() is list:
+            return True
+        return self._schema_property_type(expr, context_op) is list
+
+    def _schema_property_type(
+        self,
+        expr: QueryExpression,
+        context_op: LogicalOperator | None,
+    ) -> type[Any] | None:
+        """Look up a property's declared type in the operator's schema.
+
+        AST nodes often reach the renderer with ``data_type`` unset, so
+        ``evaluate_type()`` alone cannot drive type dispatch (Cypher
+        ``size()``/``+`` are polymorphic). The operator's input schema is
+        the planner's authoritative view: entity fields carry each
+        property's declared Python type from the graph schema.
+        """
+        if (
+            context_op is None
+            or not isinstance(expr, QueryExpressionProperty)
+            or not expr.property_name
+        ):
+            return None
+        schema = getattr(context_op, "input_schema", None)
+        if not schema:
+            return None
+        entity = schema.get_field(expr.variable_name)
+        if isinstance(entity, EntityField):
+            for value_field in entity.encapsulated_fields:
+                if value_field.field_alias == expr.property_name:
+                    return value_field.data_type
+        return None
+
+    def _render_as_array_value(
+        self, expr: QueryExpression, context_op: LogicalOperator
+    ) -> str:
+        """Render an expression as an ARRAY *value*.
+
+        ``_render_list`` emits ``(a, b)`` because its main consumer is SQL
+        ``IN`` lists; contexts that need a first-class array (CONCAT
+        operands) must wrap the elements in ``ARRAY(...)`` instead.
+        """
+        if isinstance(expr, QueryExpressionList):
+            items = [
+                self.render_expression(item, context_op)
+                for item in expr.items
+            ]
+            return f"ARRAY({', '.join(items)})"
+        return self.render_expression(expr, context_op)
+
+    def _has_string_type(
+        self,
+        expr: QueryExpression,
+        context_op: LogicalOperator | None = None,
+    ) -> bool:
         """Check if an expression is string-typed (recursively for + chains)."""
         expr_type = expr.evaluate_type()
         if expr_type is str:
             return True
         if isinstance(expr, QueryExpressionValue) and isinstance(expr.value, str):
+            return True
+        if self._schema_property_type(expr, context_op) is str:
             return True
         # Recurse into + chains: if (a + 'x') is the left operand,
         # the inner 'x' makes the whole chain string concatenation
@@ -327,9 +425,9 @@ class ExpressionRenderer:
             if expr.operator and expr.operator.name == BinaryOperator.PLUS:
                 left = expr.left_expression
                 right = expr.right_expression
-                if left and self._has_string_type(left):
+                if left and self._has_string_type(left, context_op):
                     return True
-                if right and self._has_string_type(right):
+                if right and self._has_string_type(right, context_op):
                     return True
         return False
 
@@ -457,6 +555,17 @@ class ExpressionRenderer:
 
         func = expr.function
 
+        # Cypher size() is polymorphic: element count for lists/maps,
+        # character count for strings. Spark's SIZE() is array/map-only, so
+        # a string operand must become LENGTH() — the blanket template used
+        # to emit SIZE(<string>), a type error at execution time.
+        if (
+            func == Function.SIZE
+            and expr.parameters
+            and self._has_string_type(expr.parameters[0], context_op)
+        ):
+            return f"LENGTH({params[0]})"
+
         # --- Data-driven dispatch for simple functions ---
         tmpl = FUNCTION_TEMPLATES.get(func)
         if tmpl is not None:
@@ -549,9 +658,15 @@ class ExpressionRenderer:
                     return self._parse_iso8601_duration(rendered[1:-1])
             return "INTERVAL '0' DAY"
         else:
-            raise NotImplementedError(
-                f"_render_function: unsupported function {func!r}. "
-                f"Add to FUNCTION_TEMPLATES in dialect.py or add an explicit handler."
+            # Library error, never NotImplementedError: this is reachable by
+            # any user query calling a function without a translation, and
+            # the message must name what they wrote (raw_name), not the
+            # parser's INVALID placeholder.
+            user_name = expr.raw_name or func.name.lower()
+            raise TranspilerNotSupportedException(
+                f"Function '{user_name}()' is not supported by the "
+                f"transpiler. See docs/limitations.md for the list of "
+                f"supported functions and workarounds."
             )
 
     def _render_aggregation(
@@ -601,8 +716,27 @@ class ExpressionRenderer:
         if expr.is_distinct:
             inner = f"DISTINCT {inner}"
 
-        pattern = AGGREGATION_PATTERNS.get(expr.aggregation_function, "{0}")
-        return pattern.format(inner)
+        pattern = AGGREGATION_PATTERNS.get(expr.aggregation_function)
+        if pattern is None:
+            # A silent "{0}" fallback here once emitted the bare operand for
+            # percentileCont(), turning an aggregate into a per-row
+            # projection — a wrong answer with no warning. Fail loudly.
+            raise TranspilerNotSupportedException(
+                f"Aggregation function "
+                f"'{expr.aggregation_function.name.lower()}' has no SQL "
+                f"translation. Add it to AGGREGATION_PATTERNS in dialect.py."
+            )
+
+        extras = [
+            self.render_expression(p, context_op)
+            for p in expr.extra_parameters
+        ]
+        if "{1}" in pattern and not extras:
+            raise TranspilerSyntaxErrorException(
+                f"{expr.aggregation_function.name.lower()} requires a "
+                f"second argument (e.g. percentileCont(expr, 0.5))."
+            )
+        return pattern.format(inner, *extras)
 
     def _render_ordered_collect(
         self, expr: QueryExpressionAggregationFunction, context_op: LogicalOperator
@@ -1275,9 +1409,9 @@ class ExpressionRenderer:
         tmpl = FUNCTION_TEMPLATES.get(func)
         if tmpl is not None:
             return render_from_template(tmpl, params)
-        raise NotImplementedError(
-            f"_render_function_with_params: unsupported function {func!r}. "
-            f"Add to FUNCTION_TEMPLATES in dialect.py or add an explicit handler."
+        raise TranspilerNotSupportedException(
+            f"Function '{func.name.lower()}()' is not supported inside "
+            f"list predicates. See docs/limitations.md."
         )
 
     def _render_exists(
@@ -1710,9 +1844,10 @@ class ExpressionRenderer:
             if tmpl is not None:
                 return render_from_template(tmpl, params)
 
-            raise NotImplementedError(
-                f"render_edge_filter_expression: unsupported function {func!r}. "
-                f"Add to FUNCTION_TEMPLATES in dialect.py or add an explicit handler."
+            raise TranspilerNotSupportedException(
+                f"Function '{func.name.lower()}()' is not supported inside "
+                f"a variable-length path edge filter. See "
+                f"docs/limitations.md."
             )
 
         elif isinstance(expr, QueryExpressionValue):

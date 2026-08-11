@@ -6,6 +6,7 @@ TDD - Estes testes devem FALHAR antes da implementação.
 import pytest
 
 from gsql2rsql import GraphContext
+from gsql2rsql.common.exceptions import TranspilerNotSupportedException
 
 
 def test_match_without_label_should_work():
@@ -189,47 +190,42 @@ def test_inline_label_still_works():
     print("✅ Backward compatibility mantido!")
 
 
-def test_where_overrides_inline():
-    """WHERE a:Company deve sobrescrever (a:Person) inline."""
+def test_where_label_predicate_is_rejected_loudly():
+    """``WHERE a:Company`` raises until label predicates are implemented.
+
+    The previous version of this test asserted that both `'Person'` and
+    `'Company'` appeared in the SQL — but the `'Company'` match was
+    satisfied by the pattern's own ``(c:Company)`` label, not by the WHERE
+    clause. The label predicate itself was silently dropped (the WHERE
+    rendered as a bare, non-boolean ``_gsql2rsql_a_id`` column), so the
+    assertion was vacuously green over a silent wrong answer.
+
+    The transpiler now rejects the construct with an actionable error;
+    this test locks that contract in until the feature lands (see the
+    5 skip-marked tests in test_where_label_predicates.py).
+    """
     graph = GraphContext(
         nodes_table="catalog.schema.nodes",
         edges_table="catalog.schema.edges",
         extra_node_attrs={"name": str},
-        
     )
     graph.set_types(
         node_types=["Person", "Company"],
         edge_types=["WORKS_AT"]
     )
 
-    print("\n" + "=" * 80)
-    print("TESTE 5: WHERE sobrescreve label inline")
-    print("=" * 80)
-
-    # Caso edge: label inline diferente do WHERE
-    # OpenCypher: WHERE a:Company sobrescreve (a:Person)
-    # Resultado: retorna vazio (impossível ser Person E Company)
     query = """
     MATCH (a:Person)-[:WORKS_AT]->(c:Company)
     WHERE a:Company
     RETURN a.name
     """
 
-    print("Query:")
-    print(query)
+    with pytest.raises(TranspilerNotSupportedException) as exc_info:
+        graph.transpile(query)
 
-    sql = graph.transpile(query)
-
-    print("\n✅ SUCESSO! SQL gerado:")
-    print(sql)
-
-    # SQL deve ter ambos os filtros (Person do inline, Company do WHERE)
-    # Isso resulta em query vazia (AND impossível), mas é semanticamente
-    # correto
-    assert "'Person'" in sql or "node_type = 'Person'" in sql
-    assert "'Company'" in sql or "node_type = 'Company'" in sql
-
-    print("✅ Ambos os filtros presentes (query vazia esperada)!")
+    message = str(exc_info.value)
+    assert "Label predicate" in message or "label predicate" in message
+    assert "Company" in message
 
 
 def test_variable_path_without_labels():

@@ -239,8 +239,6 @@ class SimpleSQLSchemaProvider(ISQLDBSchemaProvider):
 
         The first edge added is used as the base for untyped edge support.
         """
-        self._edges[schema.id] = schema
-
         # Create default table descriptor if not provided
         if table_descriptor is None:
             table_descriptor = SQLTableDescriptor(
@@ -249,6 +247,28 @@ class SimpleSQLSchemaProvider(ISQLDBSchemaProvider):
                 node_id_columns=["source_id", "target_id"],
             )
 
+        # An edge without id properties cannot be joined: the renderer would
+        # prune the (undeclared) key columns out of the edge subquery while
+        # still naming them in the ON clause — SQL that cannot execute.
+        # Derive them from the descriptor's [source, sink] columns; reject
+        # when even that is impossible.
+        if schema.source_id_property is None or schema.sink_id_property is None:
+            columns = table_descriptor.node_id_columns or []
+            if len(columns) < 2:
+                raise ValueError(
+                    f"Edge '{schema.name}' has no source_id_property/"
+                    f"sink_id_property and its table descriptor declares "
+                    f"{len(columns)} node_id_columns — the join keys cannot "
+                    f"be determined. Provide both id properties on the "
+                    f"EdgeSchema or two node_id_columns ([source, sink]) on "
+                    f"the SQLTableDescriptor."
+                )
+            if schema.source_id_property is None:
+                schema.source_id_property = EntityProperty(columns[0], int)
+            if schema.sink_id_property is None:
+                schema.sink_id_property = EntityProperty(columns[1], int)
+
+        self._edges[schema.id] = schema
         self._table_descriptors[schema.id] = table_descriptor
         # Auto-detect base edge table from first edge added
         if self._base_edge_table is None:

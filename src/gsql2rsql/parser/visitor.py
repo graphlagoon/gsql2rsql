@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any
 
 from gsql2rsql.common.exceptions import (
@@ -375,8 +376,15 @@ class CypherVisitor:
 
     def _apply_return_result(self, part: PartialQueryNode, result: dict[str, Any]) -> None:
         """Apply return clause results to a partial query node."""
-        if "body" in result:
-            part.return_body = result["body"]
+        body = result.get("body", [])
+        if result.get("star"):
+            # RETURN * / WITH * — openCypher: project every named variable
+            # in scope. Left unexpanded, the empty projection passed the
+            # renderer's internal `_gsql2rsql_*` columns (and anonymous
+            # edge plumbing) straight to the user.
+            body = self._expand_star_projections(part) + body
+        if body:
+            part.return_body = body
         if "distinct" in result:
             part.is_distinct = result["distinct"]
         if "order" in result:
@@ -385,6 +393,37 @@ class CypherVisitor:
             part.limit_clause = result["limit"]
         if "having" in result:
             part.having_expression = result["having"]
+
+    def _expand_star_projections(
+        self, part: PartialQueryNode
+    ) -> list[QueryExpressionWithAlias]:
+        """Expand ``*`` to the part's named variables, in declaration order.
+
+        Covers node/relationship aliases from MATCH patterns and UNWIND
+        variables. Unnamed entities (empty alias — the planner names those
+        ``_anonN`` later) are join plumbing, not user variables, and are
+        skipped. Named paths are also skipped: projecting a whole path is
+        not supported, and ``RETURN *`` must not fail a query whose path
+        variable is only consumed by relationships()/nodes().
+        """
+        aliases: list[str] = []
+        for match in part.match_clauses:
+            for entity in match.pattern_parts:
+                if entity.alias and entity.alias not in aliases:
+                    aliases.append(entity.alias)
+        for unwind in part.unwind_clauses:
+            if unwind.variable_name and unwind.variable_name not in aliases:
+                aliases.append(unwind.variable_name)
+
+        return [
+            QueryExpressionWithAlias(
+                inner_expression=QueryExpressionProperty(
+                    variable_name=alias, property_name=None
+                ),
+                alias=alias,
+            )
+            for alias in aliases
+        ]
 
     def _reject_updating_clauses(self, updating_clauses: list[Any]) -> None:
         """Reject write operations — this transpiler only supports read queries."""
@@ -724,7 +763,13 @@ class CypherVisitor:
         result["distinct"] = any(t.upper() == "DISTINCT" for t in text_children)
 
         if ctx.oC_ProjectionItems():
-            items = self.visit(ctx.oC_ProjectionItems())
+            items_ctx = ctx.oC_ProjectionItems()
+            # Grammar: ( '*' ( ',' item )* ) | ( item ( ',' item )* ).
+            # The star form has no ProjectionItem child of its own, so it
+            # must be flagged here and expanded once the enclosing part's
+            # variables are known (_apply_return_result).
+            result["star"] = items_ctx.getText().startswith("*")
+            items = self.visit(items_ctx)
             if isinstance(items, list):
                 result["body"] = items
 
@@ -786,11 +831,30 @@ class CypherVisitor:
     def visit_oC_ProjectionItems(self, ctx: Any) -> list[QueryExpressionWithAlias]:
         """Visit projection items context."""
         items: list[QueryExpressionWithAlias] = []
+        auto_derived: list[bool] = []
 
         for item_ctx in ctx.oC_ProjectionItem() or []:
             item = self.visit(item_ctx)
             if isinstance(item, QueryExpressionWithAlias):
                 items.append(item)
+                auto_derived.append(item_ctx.oC_Variable() is None)
+
+        # Unaliased projections derive their name from the property alone, so
+        # `RETURN a.name, b.name` collapses to two columns both called
+        # `name` — ambiguous for anything selecting by name downstream.
+        # Qualify auto-derived aliases with the variable when they collide;
+        # explicit `AS` aliases are the user's choice and are never touched.
+        alias_counts = Counter(item.alias for item in items)
+        for item, derived in zip(items, auto_derived):
+            if not derived or alias_counts[item.alias] <= 1:
+                continue
+            inner = item.inner_expression
+            if (
+                isinstance(inner, QueryExpressionProperty)
+                and inner.variable_name
+                and inner.property_name
+            ):
+                item.alias = f"{inner.variable_name}_{inner.property_name}"
 
         return items
 
@@ -1096,6 +1160,16 @@ class CypherVisitor:
                     result.property_name = prop_name
             elif rule_name == "OC_ListOperatorExpressionContext":
                 result = self._apply_list_operator(result, child)
+            elif rule_name == "OC_NodeLabelsContext":
+                # A label test in expression position (`WHERE a:Person`).
+                # Silently skipping it used to reduce the predicate to the
+                # bare variable, which rendered as a non-boolean WHERE on
+                # the id column — invalid SQL with no transpiler error.
+                raise TranspilerNotSupportedException(
+                    f"Label predicates in expressions are not supported: "
+                    f"'{ctx.getText()}'. Move the label into the pattern "
+                    f"instead, e.g. MATCH (x{child.getText()})."
+                )
 
         return result
 
@@ -1181,6 +1255,17 @@ class CypherVisitor:
     def visit_oC_PropertyOrLabelsExpression(self, ctx: Any) -> QueryExpression:
         """Visit a property or labels expression context."""
         result = self.visit(ctx.oC_Atom())
+
+        # A label test in expression position (`WHERE a:Person`). Silently
+        # ignoring it used to reduce the predicate to the bare variable,
+        # which rendered as a non-boolean WHERE on the id column.
+        if ctx.oC_NodeLabels():
+            labels = ctx.oC_NodeLabels().getText()
+            raise TranspilerNotSupportedException(
+                f"Label predicates in expressions are not supported: "
+                f"'{ctx.getText()}'. Move the label into the pattern "
+                f"instead, e.g. MATCH (x{labels})."
+            )
 
         # Handle property lookups
         for lookup_ctx in ctx.oC_PropertyLookup() or []:
@@ -1375,6 +1460,9 @@ class CypherVisitor:
                 is_distinct=is_distinct,
                 inner_expression=params[0] if params else None,
                 order_by=order_by,
+                # e.g. the percentile in percentileCont(x, 0.5) — dropping
+                # these silently changes the aggregate's meaning.
+                extra_parameters=params[1:],
             )
 
         # Check if it's a regular function
@@ -1385,10 +1473,12 @@ class CypherVisitor:
                 parameters=params,
             )
 
-        # Unknown function - return as generic function
+        # Unknown function — keep the user's spelling so the renderer's
+        # rejection can name it instead of the INVALID placeholder.
         return QueryExpressionFunction(
             function=Function.INVALID,
             parameters=params,
+            raw_name=func_name,
         )
 
     def visit_oC_ParenthesizedExpression(self, ctx: Any) -> QueryExpression:
