@@ -184,6 +184,9 @@ class QueryExpressionFunction(QueryExpression):
     function: Function
     parameters: list[QueryExpression] = field(default_factory=list)
     data_type: type[Any] | None = None
+    # The name as the user wrote it. Set for Function.INVALID so error
+    # messages can name the actual function instead of 'INVALID'.
+    raw_name: str = ""
 
     @property
     def children(self) -> list[TreeNode]:
@@ -212,12 +215,17 @@ class QueryExpressionAggregationFunction(QueryExpression):
     # Order by for ordered aggregation (e.g., COLLECT(x ORDER BY y DESC))
     # List of (expression, is_descending) tuples
     order_by: list[tuple[QueryExpression, bool]] = field(default_factory=list)
+    # Arguments beyond the aggregated expression, e.g. the percentile in
+    # percentileCont(x, 0.5). Kept separate from inner_expression because
+    # they parameterise the aggregate rather than being aggregated.
+    extra_parameters: list[QueryExpression] = field(default_factory=list)
 
     @property
     def children(self) -> list[TreeNode]:
         result: list[TreeNode] = []
         if self.inner_expression:
             result.append(self.inner_expression)
+        result.extend(self.extra_parameters)
         for expr, _ in self.order_by:
             result.append(expr)
         return result
@@ -228,6 +236,7 @@ class QueryExpressionAggregationFunction(QueryExpression):
     def __str__(self) -> str:
         distinct = "DISTINCT " if self.is_distinct else ""
         inner = str(self.inner_expression) if self.inner_expression else "*"
+        extras = "".join(f", {p}" for p in self.extra_parameters)
         order = ""
         if self.order_by:
             items = ", ".join(
@@ -235,7 +244,10 @@ class QueryExpressionAggregationFunction(QueryExpression):
                 for expr, desc in self.order_by
             )
             order = f" ORDER BY {items}"
-        return f"{self.aggregation_function.name}({distinct}{inner}{order})"
+        return (
+            f"{self.aggregation_function.name}"
+            f"({distinct}{inner}{extras}{order})"
+        )
 
 
 @dataclass

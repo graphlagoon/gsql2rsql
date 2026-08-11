@@ -27,6 +27,12 @@ Databricks SQL. Anything that mutates the graph is out of scope by design.
 | Geospatial (`point()`, `distance()`) | ❌ | Use Databricks geospatial SQL directly |
 | `!=` operator | ❌ deliberate | Use `<>` — `!=` is rejected as a syntax error |
 | Standalone `UNWIND ... RETURN` (no `MATCH`) | ❌ | Fails with "Empty partial query" |
+| `percentileCont()`, `percentileDisc()` | ✅ | `PERCENTILE_CONT/DISC ... WITHIN GROUP` |
+| `LIMIT $n` / `SKIP $n` (parameters) | ❌ | Inline the value — rejected with a clear error |
+| Label predicates `WHERE a:Person` | ❌ | Move the label into the pattern: `MATCH (a:Person)` |
+| `split()`, `substring()`, `replace()`, `reverse()`, `head()`, `tail()`, `keys()`, `labels()`, `id()`, `properties()` | ❌ | Rejected with an error naming the function |
+| Unbounded VLP `-[:TYPE*]->` | ⚠️ | Silently capped at 10 hops — write an explicit bound (`*1..15` is honoured as-is) |
+| Relationship uniqueness (edge isomorphism) | ⚠️ | Not enforced — see [Correctness Caveats](#correctness-caveats) |
 
 ---
 
@@ -129,6 +135,14 @@ Two edge-type situations behave differently on purpose:
   expression text: `RETURN count(DISTINCT d)` produces a column called
   `count_DISTINCT_d`, `count(*)` produces `count_star`. Add `AS name` to
   control the output column name.
+- **Colliding unaliased property projections are qualified**: in
+  `RETURN a.name, b.name` both columns would be called `name`, so they
+  become `a_name` and `b_name`. A single `RETURN p.name` still produces
+  `name`. Explicit `AS` aliases are never rewritten.
+- **`RETURN *` / `WITH *` expand to the named variables in scope** —
+  nodes and relationships project as structs of their properties, the
+  same as `RETURN a`. Anonymous pattern parts and named path variables
+  are not included.
 - **Multi-label syntax is not supported**: `(a:Person:Company)` silently
   uses only the first label and `(a:Person|Company)` is a parser error.
   Workaround: `WHERE a.node_type IN ['Person', 'Company']`.
@@ -150,6 +164,19 @@ Two edge-type situations behave differently on purpose:
   single aggregation; explicitly alias every aggregated column.
 - **Self-loops in undirected patterns** (`(a)-[:KNOWS]-(a)`) may appear
   twice in results due to the UNION ALL expansion.
+- **Relationship uniqueness (edge isomorphism) is not enforced** in
+  fixed-length patterns. openCypher requires each relationship in a
+  `MATCH` pattern to bind a distinct edge; the transpiler can reuse one
+  edge for several pattern relationships. Example: with a single
+  self-loop edge `A→A`, `MATCH (a)-[:T]->(b)-[:T]->(a)` matches by using
+  that edge for both hops, where openCypher would return nothing.
+  Variable-length paths are unaffected (the `visited` array prevents
+  node revisits).
+- **Unbounded variable-length paths are depth-capped at 10**: `*` and
+  `*2..` are rewritten to a maximum of 10 hops with no warning, so paths
+  longer than 10 are silently absent. Explicit bounds are honoured
+  exactly, including above 10 (`*1..15` renders `depth < 15`). Always
+  write an explicit upper bound for graphs whose diameter may exceed 10.
 
 ---
 

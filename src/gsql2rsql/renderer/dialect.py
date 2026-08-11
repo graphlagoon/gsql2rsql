@@ -113,6 +113,13 @@ AGGREGATION_PATTERNS: dict[AggregationFunction, str] = {
     AggregationFunction.STDEVP: "STDDEV_POP({0})",
     AggregationFunction.COUNT: "COUNT({0})",
     AggregationFunction.COLLECT: "COLLECT_LIST({0})",
+    # {1} is the percentile argument (percentileCont(x, 0.5) -> 0.5).
+    AggregationFunction.PERCENTILE_CONT: (
+        "PERCENTILE_CONT({1}) WITHIN GROUP (ORDER BY {0})"
+    ),
+    AggregationFunction.PERCENTILE_DISC: (
+        "PERCENTILE_DISC({1}) WITHIN GROUP (ORDER BY {0})"
+    ),
 }
 
 
