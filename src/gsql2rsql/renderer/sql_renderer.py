@@ -11,6 +11,8 @@ from gsql2rsql.common.exceptions import (
 from gsql2rsql.common.logging import ILoggable
 from gsql2rsql.parser.ast import (
     QueryExpression,
+    QueryExpressionFunction,
+    QueryExpressionListPredicate,
     QueryExpressionProperty,
 )
 from gsql2rsql.parser.operators import (
@@ -241,6 +243,7 @@ class SQLRenderer:
                 for op in self._walk_operators(start_op)
             )
             if has_recursive:
+                self._validate_procedural_path_functions(plan)
                 return self._render_plan_procedural(plan)
 
         # Collect any operators that need CTEs
@@ -320,6 +323,88 @@ class SQLRenderer:
             result.append(current)
             stack.extend(current.out_operators)
         return result
+
+    def _validate_procedural_path_functions(self, plan: LogicalPlan) -> None:
+        """Reject nodes(p)/length(p) when rendering procedurally.
+
+        Procedural BFS never reconstructs the path node array: the final
+        view emits ``CAST(NULL AS ARRAY<STRING>) AS path``, so any
+        expression consuming it — ``nodes(p)``, ``length(p)`` (rendered as
+        ``SIZE(path) - 1``) — would silently evaluate to NULL at execution.
+        ``relationships(p)`` stays supported (``path_edges`` IS built).
+        Failing at transpile time with a pointer to CTE mode beats a
+        silently-NULL result column.
+        """
+        from gsql2rsql.common.exceptions import (
+            TranspilerNotSupportedException,
+        )
+
+        all_ops = [
+            op
+            for start_op in plan.starting_operators
+            for op in self._walk_operators(start_op)
+        ]
+        path_vars = {
+            op.path_variable
+            for op in all_ops
+            if isinstance(op, RecursiveTraversalOperator) and op.path_variable
+        }
+        if not path_vars:
+            return
+
+        def find_offender(expr: QueryExpression) -> str | None:
+            # ALL/ANY/NONE/SINGLE over nodes(p) are handled by the
+            # filtered-edges pushdown (no path array read), so the
+            # nodes(p) list head there is NOT an offender; the inner
+            # predicate is still walked (it binds the lambda variable,
+            # not the path).
+            if isinstance(expr, QueryExpressionListPredicate):
+                if expr.filter_expression is not None:
+                    return find_offender(expr.filter_expression)
+                return None
+            if isinstance(expr, QueryExpressionFunction) and expr.function in (
+                Function.NODES,
+                Function.LENGTH,
+            ):
+                for param in expr.parameters:
+                    if (
+                        isinstance(param, QueryExpressionProperty)
+                        and param.property_name is None
+                        and param.variable_name in path_vars
+                    ):
+                        return (
+                            "nodes"
+                            if expr.function == Function.NODES
+                            else "length"
+                        )
+            for child in expr.children:
+                if isinstance(child, QueryExpression):
+                    found = find_offender(child)
+                    if found:
+                        return found
+            return None
+
+        for op in all_ops:
+            for value in vars(op).values():
+                candidates: list[Any] = (
+                    list(value) if isinstance(value, (list, tuple)) else [value]
+                )
+                for item in candidates:
+                    if isinstance(item, tuple):
+                        candidates.extend(item)
+                        continue
+                    if not isinstance(item, QueryExpression):
+                        continue
+                    offender = find_offender(item)
+                    if offender:
+                        raise TranspilerNotSupportedException(
+                            f"{offender}(<path>) requires the path node "
+                            f"array, which procedural BFS does not build "
+                            f"(the path column is NULL). Use "
+                            f"vlp_rendering_mode='cte', or restructure the "
+                            f"query around relationships(<path>), which "
+                            f"procedural mode supports."
+                        )
 
     def _render_plan_procedural(self, plan: LogicalPlan) -> str:
         """Render plan using procedural BFS instead of WITH RECURSIVE CTEs."""
