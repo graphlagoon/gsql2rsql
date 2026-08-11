@@ -266,6 +266,32 @@ uv run pytest tests -n 8 -v
 # - EITHER_AS_SOURCE/SINK: Single-hop uses UNION ALL expansion
 ```
 
+### 7. Update Limitations Docs (MANDATORY when applicable)
+
+Two documents track limitations, with different audiences:
+
+| File | Audience | Published |
+|------|----------|-----------|
+| `docs_help_dev/limitations.md` | Developers (internal) | No |
+| `docs/limitations.md` | Users (mkdocs site, nav: User Guide → Limitations) | Yes |
+
+**Update BOTH whenever the fix:**
+
+- adds a `TranspilerNotSupportedException` or any guardrail (static or
+  runtime `RAISE_ERROR`) — the construct is now a *documented* limitation;
+- reveals a pre-existing unsupported construct (even if you don't fix it);
+- REMOVES a limitation (feature now works) — delete/update stale entries;
+- changes which constructs work per rendering mode — keep the
+  **CTE vs Procedural matrix** in `docs/limitations.md` in sync;
+- improves an error message users will see — the "error messages" section
+  of `docs/limitations.md` shows real message examples; keep them accurate.
+
+**Why:** a limitation that only exists as an exception in code is invisible
+until a user hits it. Silent-wrong-result bugs converted to loud errors
+(the preferred pattern) MUST land in the user-facing doc in the same PR.
+
+Verify the site still builds: `uv run mkdocs build` (no NEW warnings).
+
 ---
 
 ## Test Categories to Cover
@@ -367,6 +393,9 @@ assert results == {"Alice", "Carol", "Eve"}  # Exact expected values
 * The fix is explained with a root-cause diagnosis and a trade-off analysis.
 * The solution preserves (or documents deliberate, justified changes to) the Separation of Concerns.
 * Tests added/changed are reviewed and are robust (not flaky).
+* If the fix added/removed a limitation, guardrail, or `NotSupported` path,
+  BOTH `docs_help_dev/limitations.md` and `docs/limitations.md` are updated
+  (see step 7) and `uv run mkdocs build` passes with no new warnings.
 
 ---
 

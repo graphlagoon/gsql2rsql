@@ -399,6 +399,10 @@ class SimpleSQLSchemaProvider(ISQLDBSchemaProvider):
         """Get all registered node schemas."""
         return list(self._nodes.values())
 
+    def get_all_edge_schemas(self) -> list[EdgeSchema]:
+        """Get all registered edge schemas."""
+        return list(self._edges.values())
+
     def get_edge_definition(
         self, edge_verb: str, from_node_name: str, to_node_name: str
     ) -> EdgeSchema | None:

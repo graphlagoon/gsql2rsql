@@ -39,6 +39,7 @@ from gsql2rsql.planner.operators import (
     LogicalOperator,
     RecursiveTraversalOperator,
 )
+from gsql2rsql.planner.operators.data_source import validate_edge_verbs_exist
 from gsql2rsql.planner.path_analyzer import (
     PathExpressionAnalyzer,
     remove_pushed_predicates,
@@ -104,6 +105,13 @@ def create_recursive_match_tree(
         edge_types = [
             t.strip() for t in rel.entity_name.split("|") if t.strip()
         ]
+
+    # Unknown verbs must fail here, at binding time, with an actionable
+    # message. Without this, the wildcard fallback below silently absorbs
+    # the typo and the enrichment pass later dies with a cryptic
+    # "No enriched data for RecursiveTraversalOperator" internal error.
+    if graph_schema is not None and edge_types:
+        validate_edge_verbs_exist(edge_types, graph_schema, rel.alias)
 
     # Extract source node filter from WHERE clause for optimization
     start_node_filter, remaining_where = extract_source_node_filter(

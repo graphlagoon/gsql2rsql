@@ -166,6 +166,7 @@ nav:
   - User Guide:
     - Getting Started: user-guide.md
     - Functions Reference: functions.md
+    - Limitations: limitations.md
     - Examples:
       - examples/index.md
       - Fraud Detection: examples/fraud.md

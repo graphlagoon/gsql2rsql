@@ -67,6 +67,72 @@ def _describe_available_node_types(
     return f".{hint} Available node types: {', '.join(repr(n) for n in available)}"
 
 
+def _describe_available_edge_verbs(
+    graph_definition: IGraphSchemaProvider,
+    requested: str,
+) -> str:
+    """Build an actionable suffix for a failed edge-verb lookup.
+
+    Mirror of ``_describe_available_node_types``: verb lookup is exact and
+    case-sensitive, so a case difference or stray whitespace in the schema
+    registration is the overwhelmingly common cause.  Best-effort only —
+    providers that cannot enumerate their edges degrade to an empty suffix.
+    """
+    try:
+        get_all = getattr(graph_definition, "get_all_edge_schemas", None)
+        if get_all is None:
+            return ""
+        available = sorted({
+            schema.name for schema in get_all() if getattr(schema, "name", None)
+        })
+    except Exception:  # pragma: no cover - defensive
+        return ""
+
+    if not available:
+        return ""
+
+    near = [
+        name
+        for name in available
+        if name.strip().casefold() == requested.strip().casefold()
+    ]
+    hint = ""
+    if near:
+        hint = (
+            f" Did you mean '{near[0]}'? Edge type names are matched exactly "
+            f"(case-sensitive, whitespace-sensitive)."
+        )
+
+    return f".{hint} Available edge types: {', '.join(repr(n) for n in available)}"
+
+
+def validate_edge_verbs_exist(
+    raw_edge_types: list[str],
+    graph_definition: IGraphSchemaProvider,
+    rel_alias: str,
+) -> None:
+    """Raise if any named edge verb does not exist anywhere in the schema.
+
+    Distinguishes a typo (the verb is registered for NO endpoint pair —
+    raise with suggestions) from endpoint pruning (the verb exists but not
+    for the pattern's endpoint types — silently dropped by the caller,
+    which is load-bearing for schemas registered with restricted
+    ``edge_combinations``).
+
+    Called from both single-hop binding and the VLP planner so unknown
+    verbs fail at BINDING time, not as a late enrichment internal error.
+    """
+    from gsql2rsql.common.exceptions import TranspilerBindingException
+
+    for verb in raw_edge_types:
+        if not graph_definition.find_edges_by_verb(verb):
+            raise TranspilerBindingException(
+                f"Failed to bind relationship '{rel_alias}' "
+                f"of type '{verb}'"
+                + _describe_available_edge_verbs(graph_definition, verb)
+            )
+
+
 @dataclass
 class _BindingResult:
     """Result of binding an entity to a graph schema.
@@ -221,6 +287,12 @@ class DataSourceOperator(StartLogicalOperator, IBindable):
             t.strip() for t in rel_entity.entity_name.split("|") if t.strip()
         ]
 
+        # A verb that exists for NO endpoint pair is a typo — fail with
+        # suggestions before endpoint pruning silently drops it from an OR.
+        validate_edge_verbs_exist(
+            raw_edge_types, graph_definition, rel_entity.alias
+        )
+
         # Determine source/sink based on direction
         source_type, sink_type = self._get_endpoint_types(rel_entity)
 
@@ -238,7 +310,11 @@ class DataSourceOperator(StartLogicalOperator, IBindable):
             if not edge_def:
                 raise TranspilerBindingException(
                     f"Failed to bind relationship '{rel_entity.alias}' "
-                    f"of type '{rel_entity.entity_name}'"
+                    f"of type '{rel_entity.entity_name}': the type exists "
+                    f"but not between the pattern's endpoint node types"
+                    + _describe_available_edge_verbs(
+                        graph_definition, rel_entity.entity_name
+                    )
                 )
 
         # Build ID fields
